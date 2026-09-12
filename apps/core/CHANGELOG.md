@@ -1,3 +1,14 @@
+## [14.10.2](https://github.com/mx-space/core/compare/v14.10.1...v14.10.2) (2026-09-13)
+
+### Bug Fixes
+
+* **push:** send content notifications when drafts are published ([43446bf](https://github.com/mx-space/core/commit/43446bf1e73affb1ab32cf452bae47d20eb5cccd))
+
+
+### Features
+
+* **core:** broadcast draft head changes to admin clients ([2703448](https://github.com/mx-space/core/commit/2703448ec5fb8a6b9949d9fa11adf83a98f62580))
+
 ## [14.10.1](https://github.com/mx-space/core/compare/v14.10.0...v14.10.1) (2026-09-13)
 
 ### Bug Fixes
