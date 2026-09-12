@@ -1,42 +1,41 @@
-import { existsSync, statSync } from 'node:fs'
-import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { flatten } from 'lodash'
-import { mkdirp } from 'mkdirp'
+import { createReadStream, existsSync, statSync } from 'node:fs'
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import path, { join, resolve } from 'node:path'
 
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import {
-  BadRequestException,
   Injectable,
   InternalServerErrorException,
   Logger,
 } from '@nestjs/common'
 import { CronExpression } from '@nestjs/schedule'
+import { mkdirp } from 'mkdirp'
 
-import { DEMO_MODE, MONGO_DB } from '~/app.config'
+import { POSTGRES } from '~/app.config'
 import { CronDescription } from '~/common/decorators/cron-description.decorator'
 import { CronOnce } from '~/common/decorators/cron-once.decorator'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
-import {
-  ANALYZE_COLLECTION_NAME,
-  MIGRATE_COLLECTION_NAME,
-  WEBHOOK_EVENT_COLLECTION_NAME,
-} from '~/constants/db.constant'
 import { BACKUP_DIR, DATA_DIR } from '~/constants/path.constant'
-import { migrateDatabase } from '~/migration/migrate'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
 import { RedisService } from '~/processors/redis/redis.service'
+import { S3Uploader } from '~/utils/s3.util'
 import { scheduleManager } from '~/utils/schedule.util'
-import { getFolderSize, installPKG } from '~/utils/system.util'
+import { $, $throw } from '~/utils/shell.util'
+import { getFolderSize } from '~/utils/system.util'
 import { getMediumDateTime } from '~/utils/time.util'
 
 import { ConfigsService } from '../configs/configs.service'
 
-const excludeCollections = [
-  ANALYZE_COLLECTION_NAME,
-  WEBHOOK_EVENT_COLLECTION_NAME,
-  MIGRATE_COLLECTION_NAME,
+const excludeTables = [
+  'analyzes',
+  'webhook_events',
+  'serverless_logs',
+  'sessions',
+  'verifications',
+  'search_documents',
+  'activities',
 ]
+
 const excludeFolders = [
   'backup',
   'log',
@@ -59,6 +58,102 @@ export class BackupService {
     this.logger = new Logger(BackupService.name)
   }
 
+  private async safeListDir(dir: string, limit = 30) {
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      return entries
+        .slice(0, limit)
+        .map((e) => `${e.isDirectory() ? 'dir' : 'file'}:${e.name}`)
+        .join(', ')
+    } catch (error: any) {
+      return `<unreadable: ${error?.message || String(error)}>`
+    }
+  }
+
+  private async commandExists(command: string) {
+    const res = await $(`command -v ${command} >/dev/null 2>&1`)
+    return res.exitCode === 0
+  }
+
+  private shellQuote(value: string | number) {
+    return `'${String(value).replaceAll("'", `'\\''`)}'`
+  }
+
+  // Resolve `candidate` against `dir` and assert it stays inside `dir`.
+  // Rejects zip-slip (`../`), absolute paths, and any escape attempt.
+  private assertContained(dir: string, candidate: string): string {
+    const base = resolve(dir)
+    const target = resolve(base, candidate)
+    if (target !== base && !target.startsWith(base + path.sep)) {
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: `Path escapes target directory: ${candidate}`,
+      })
+    }
+    return target
+  }
+
+  // Safe in-process zip extraction (replaces shell `unzip`).
+  // Validates every entry against zip-slip; rejects absolute paths and symlinks.
+  private async safeUnzip(zipFilePath: string, destDir: string) {
+    const base = resolve(destDir)
+    const buffer = await readFile(zipFilePath)
+    const JSZip = (await import('jszip')).default
+    const zip = await new JSZip().loadAsync(buffer)
+
+    const entries = Object.values(zip.files)
+    for (const entry of entries) {
+      const name = entry.name
+      if (path.isAbsolute(name) || /^[a-z]:[/\\]/i.test(name)) {
+        throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+          message: `Absolute path entry rejected: ${name}`,
+        })
+      }
+      // Symlink entries carry unix mode bits with the symlink flag (0o120000).
+      const unixMode = (entry as any).unixPermissions as number | null
+      if (typeof unixMode === 'number' && (unixMode & 0o170000) === 0o120000) {
+        throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+          message: `Symlink entry rejected: ${name}`,
+        })
+      }
+      // assertContained throws if the entry escapes destDir.
+      this.assertContained(base, name)
+    }
+
+    for (const entry of entries) {
+      const target = this.assertContained(base, entry.name)
+      if (entry.dir) {
+        await mkdir(target, { recursive: true })
+        continue
+      }
+      await mkdir(path.dirname(target), { recursive: true })
+      const content = await entry.async('nodebuffer')
+      await writeFile(target, Uint8Array.from(content))
+    }
+  }
+
+  private pgPasswordEnv() {
+    return POSTGRES.password
+      ? `PGPASSWORD=${this.shellQuote(POSTGRES.password)} `
+      : ''
+  }
+
+  private get excludeTableArgs() {
+    return excludeTables.map((t) => `--exclude-table=${t}`).join(' ')
+  }
+
+  private pgConnectionArgs() {
+    if (POSTGRES.connectionString) {
+      return `--dbname ${this.shellQuote(POSTGRES.connectionString)}`
+    }
+
+    return [
+      `-h ${this.shellQuote(POSTGRES.host)}`,
+      `-p ${POSTGRES.port}`,
+      `-U ${this.shellQuote(POSTGRES.user)}`,
+      `-d ${this.shellQuote(POSTGRES.database)}`,
+    ].join(' ')
+  }
+
   async list() {
     const backupPath = BACKUP_DIR
     if (!existsSync(backupPath)) {
@@ -78,63 +173,117 @@ export class BackupService {
       })
     }
     return Promise.all(
-      backups.map(async (item) => {
-        const { path } = item
+      backups.map(async ({ filename, path }) => {
         const size = await getFolderSize(path)
-        // @ts-ignore
-        delete item.path
-        return { ...item, size }
+        return { filename, size }
       }),
     )
   }
 
   async backup() {
-    const { backupOptions: configs } = await this.configs.waitForConfigReady()
-    if (!configs.enable) {
-      return
-    }
-    this.logger.log('--> 备份数据库中')
-    // 用时间格式命名文件夹
+    this.logger.log('--> Backing up database')
+    // Use timestamp as directory name
     const dateDir = getMediumDateTime(new Date())
 
     const backupDirPath = join(BACKUP_DIR, dateDir)
     mkdirp.sync(backupDirPath)
+
+    const runStep = async (
+      step: string,
+      command: string,
+      options?: Parameters<typeof $throw>[1],
+    ) => {
+      try {
+        return await $throw(command, options)
+      } catch (error: any) {
+        error.step = step
+        error.cwd = options?.cwd || process.cwd()
+        throw error
+      }
+    }
+
     try {
-      await $`mongodump --uri ${MONGO_DB.customConnectionString || MONGO_DB.uri} -d ${
-        MONGO_DB.dbName
-      }  ${flatten(
-        excludeCollections.map((collection) => [
-          '--excludeCollection',
+      const dumpedDbDir = join(backupDirPath, 'mx-space')
+      mkdirp.sync(dumpedDbDir)
+      const dumpFilePath = join(dumpedDbDir, 'pg.dump')
 
-          collection,
-        ]),
-      )} -o ${backupDirPath} >/dev/null 2>&1`
-      // 打包 DB
-      cd(backupDirPath)
-      await $`mv ${MONGO_DB.dbName} mx-space`.quiet().nothrow()
-      await $`zip -r backup-${dateDir} mx-space/* && rm -rf mx-space`.quiet()
+      await runStep(
+        'pg_dump',
+        `${this.pgPasswordEnv()}pg_dump --format=custom ${this.excludeTableArgs} ${this.pgConnectionArgs()} -f ${this.shellQuote(dumpFilePath)}`,
+      )
 
-      // 打包数据目录
+      if (!existsSync(dumpFilePath)) {
+        const error = new Error(
+          `pg_dump ran but produced no file: ${dumpFilePath} (check DB name, connection, and permissions)`,
+        ) as any
+        error.step = 'pg_dump'
+        error.cwd = backupDirPath
+        throw error
+      }
+      const dumpStat = statSync(dumpFilePath)
+      if (dumpStat.size === 0) {
+        const error = new Error(
+          `pg_dump produced an empty file: ${dumpFilePath} (common cause of zip exit code 12)`,
+        ) as any
+        error.step = 'pg_dump'
+        error.cwd = backupDirPath
+        throw error
+      }
 
-      const flags = excludeFolders.flatMap((item) => ['--exclude', item])
-      cd(DATA_DIR)
+      // Use a directory instead of a wildcard to avoid "zip error: Nothing to do" (exit code 12) when the directory is empty
+      await runStep(
+        'zip-db',
+        `zip -r backup-${dateDir} mx-space && rm -rf mx-space`,
+        {
+          cwd: backupDirPath,
+        },
+      )
+
+      // Bundle the data directory
+
+      const flags = excludeFolders.map((item) => `--exclude ${item}`).join(' ')
       await rm(join(DATA_DIR, 'backup_data'), { recursive: true, force: true })
       await rm(join(DATA_DIR, 'temp_copy_need'), {
         recursive: true,
         force: true,
       })
 
-      await $`rsync -a . ./temp_copy_need --exclude temp_copy_need ${flags} && mv temp_copy_need backup_data && zip -r ${join(
-        backupDirPath,
-        `backup-${dateDir}`,
-      )} ./backup_data && rm -rf backup_data`
+      await runStep(
+        'zip-data',
+        `rsync -a . ./temp_copy_need --exclude temp_copy_need ${flags} && mv temp_copy_need backup_data && zip -r ${join(
+          backupDirPath,
+          `backup-${dateDir}`,
+        )} ./backup_data && rm -rf backup_data`,
+        { cwd: DATA_DIR },
+      )
 
-      this.logger.log('--> 备份成功')
+      this.logger.log('--> Backup completed successfully')
     } catch (error) {
+      const step = (error as any)?.step ? `step=${(error as any).step}` : ''
+      const cwd = (error as any)?.cwd ? `cwd=${(error as any).cwd}` : ''
+      const stderr = (error as any)?.stderr
+        ? `\n\nstderr:\n${(error as any).stderr}`
+        : ''
+      const stdout = (error as any)?.stdout
+        ? `\n\nstdout:\n${(error as any).stdout}`
+        : ''
+
+      // Extra diagnostics: command availability and current backup directory contents
+      const [hasZip, hasPgDump, hasPgRestore] = await Promise.all([
+        this.commandExists('zip'),
+        this.commandExists('pg_dump'),
+        this.commandExists('pg_restore'),
+      ])
+      const backupDirContent = await this.safeListDir(backupDirPath)
+
       this.logger.error(
-        `--> 备份失败，请确保已安装 zip 或 mongo-tools, mongo-tools 的版本需要与 mongod 版本一致，${error.message}\n\n${
-          error.stderr
-        }`,
+        `--> Backup failed (${[step, cwd].filter(Boolean).join(', ')}): ${error.message}` +
+          `${stderr}${stdout}\n\n` +
+          `diagnostics:\n` +
+          `- zip: ${hasZip ? 'found' : 'missing'}\n` +
+          `- pg_dump: ${hasPgDump ? 'found' : 'missing'}\n` +
+          `- pg_restore: ${hasPgRestore ? 'found' : 'missing'}\n` +
+          `- backupDir(${backupDirPath}): ${backupDirContent}`,
       )
       throw error
     }
@@ -148,17 +297,20 @@ export class BackupService {
 
   async getFileStream(dirname: string) {
     const path = this.checkBackupExist(dirname)
-    const stream = fs.createReadStream(path)
-
-    return stream
+    return createReadStream(path)
   }
 
   checkBackupExist(dirname: string) {
-    const path = join(BACKUP_DIR, dirname, `backup-${dirname}.zip`)
-    if (!existsSync(path)) {
-      throw new BadRequestException('文件不存在')
+    if (/[/\\]|\.\./.test(dirname)) {
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'invalid dirname',
+      })
     }
-    return path
+    const filePath = join(BACKUP_DIR, dirname, `backup-${dirname}.zip`)
+    if (!existsSync(filePath)) {
+      throw createAppException(AppErrorCode.FILE_NOT_FOUND)
+    }
+    return filePath
   }
 
   async saveTempBackupByUpload(buffer: Buffer) {
@@ -179,9 +331,9 @@ export class BackupService {
 
   async restore(restoreFilePath: string) {
     await this.backup()
-    const isExist = fs.existsSync(restoreFilePath)
+    const isExist = existsSync(restoreFilePath)
     if (!isExist) {
-      throw new InternalServerErrorException('备份文件不存在')
+      throw new InternalServerErrorException('Backup file does not exist')
     }
     const dirPath = path.dirname(restoreFilePath)
 
@@ -192,30 +344,45 @@ export class BackupService {
       }),
     )
 
-    // 解压
+    // Unzip — in-process, zip-slip-safe extraction (no shell `unzip`).
     try {
-      cd(dirPath)
-      await $`unzip ${restoreFilePath}`
-    } catch {
-      throw new InternalServerErrorException('服务端 unzip 命令未找到')
+      await this.safeUnzip(restoreFilePath, dirPath)
+    } catch (error: any) {
+      this.logger.error(
+        `unzip failed: ${error?.message || error}\n\n${error?.stderr || ''}`,
+      )
+      throw error
     }
     try {
-      // 验证
+      // Verify
       if (!existsSync(join(dirPath, 'mx-space'))) {
-        throw new InternalServerErrorException('备份文件错误，目录不存在')
+        throw new InternalServerErrorException(
+          'Invalid backup file: directory does not exist',
+        )
       }
 
-      cd(dirPath)
-      await $`mongorestore --uri ${MONGO_DB.customConnectionString || MONGO_DB.uri} -d ${MONGO_DB.dbName} ./mx-space --drop  >/dev/null 2>&1`
+      const dumpFilePath = join(dirPath, 'mx-space', 'pg.dump')
+      if (!existsSync(dumpFilePath)) {
+        throw new InternalServerErrorException(
+          'Invalid backup file: database dump does not exist',
+        )
+      }
 
-      await migrateDatabase()
+      await $throw(
+        `${this.pgPasswordEnv()}pg_restore --clean --if-exists --no-owner ${this.pgConnectionArgs()} ${this.shellQuote(dumpFilePath)}`,
+        { cwd: dirPath },
+      )
     } catch (error) {
-      this.logger.error(error)
+      this.logger.error(
+        `restore failed: ${(error as any)?.message || error}\n\n${
+          (error as any)?.stderr || ''
+        }`,
+      )
       throw error
     } finally {
       await rm(join(dirPath, 'mx-space'), { recursive: true, force: true })
     }
-    // 还原 backup_data
+    // Restore backup_data
 
     const backupDataDir = join(dirPath, 'backup_data')
 
@@ -223,31 +390,44 @@ export class BackupService {
 
     await Promise.all(
       backupDataDirFilenames.map(async (filename) => {
-        const fullpath = join(dirPath, 'backup_data', filename)
-        const targetPath = join(DATA_DIR, filename)
+        // Containment: source must stay within the extracted backup_data dir,
+        // destination within DATA_DIR. Rejects `..`/absolute filenames.
+        const fullpath = this.assertContained(backupDataDir, filename)
+        const targetPath = this.assertContained(DATA_DIR, filename)
 
         await rm(targetPath, { recursive: true, force: true })
 
-        await $`cp -r ${fullpath} ${targetPath}`
+        await $throw(
+          `cp -r ${this.shellQuote(fullpath)} ${this.shellQuote(targetPath)}`,
+        )
       }),
     )
 
+    // SECURITY: never auto-install dependencies from a restored archive.
+    // An uploaded archive is attacker-controlled; running `npm install` on its
+    // declared deps is arbitrary-code-execution via install scripts. Instead we
+    // surface the package list so an admin can review and install manually.
     try {
       const packageJson = await readFile(join(backupDataDir, 'package.json'), {
-        encoding: 'utf-8',
+        encoding: 'utf8',
       })
       const pkg = JSON.parse(packageJson)
-      if (pkg.dependencies) {
-        await Promise.all(
-          Object.entries(pkg.dependencies).map(([name, version]) => {
-            this.logger.log(`--> 安装依赖 ${name}@${version}`)
-            return installPKG(`${name}@${version}`, DATA_DIR).catch((error) => {
-              this.logger.error(`--> 依赖安装失败：${error.message}`)
-            })
-          }),
+      const deps = pkg?.dependencies
+      if (deps && typeof deps === 'object' && Object.keys(deps).length > 0) {
+        const list = Object.entries(deps)
+          .map(([name, version]) => `${name}@${version}`)
+          .join(', ')
+        this.logger.warn(
+          `--> Restored archive declares ${
+            Object.keys(deps).length
+          } dependencies. Automatic installation is disabled for security ` +
+            `(install scripts can execute arbitrary code). Review and install ` +
+            `manually if required: ${list}`,
         )
       }
-    } catch {}
+    } catch {
+      // package.json absent or unpar. Restores without a manifest are valid.
+    }
 
     await Promise.all([
       this.redisService.cleanAllRedisKey(),
@@ -270,27 +450,30 @@ export class BackupService {
     )
   }
 
-  async deleteBackup(filename) {
-    const path = join(BACKUP_DIR, filename)
-    if (!existsSync(path)) {
-      throw new BadRequestException('文件不存在')
+  async deleteBackup(filename: string) {
+    if (/[/\\]|\.\./.test(filename)) {
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'invalid filename',
+      })
+    }
+    const filePath = join(BACKUP_DIR, filename)
+    if (!existsSync(filePath)) {
+      throw createAppException(AppErrorCode.FILE_NOT_FOUND)
     }
 
-    await rm(path, { recursive: true })
+    await rm(filePath, { recursive: true })
     return true
   }
 
   @CronOnce(CronExpression.EVERY_DAY_AT_1AM, { name: 'backupDB' })
-  @CronDescription('备份 DB 并上传 COS')
+  @CronDescription('Back up the database and upload to object storage')
   async backupDB() {
-    if (DEMO_MODE) {
+    const { backupOptions: configs } = await this.configs.waitForConfigReady()
+    if (!configs.enable) {
       return
     }
+
     const backup = await this.backup()
-    if (!backup) {
-      this.logger.log('没有开启备份')
-      return
-    }
 
     scheduleManager.schedule(async () => {
       const { backupOptions } = await this.configs.waitForConfigReady()
@@ -301,29 +484,25 @@ export class BackupService {
         return
       }
 
-      const s3 = new S3Client({
+      const s3 = new S3Uploader({
+        bucket,
         region,
+        accessKey: secretId,
+        secretKey,
         endpoint,
-        credentials: {
-          accessKeyId: secretId,
-          secretAccessKey: secretKey,
-        },
       })
 
-      const remoteFileKey = backup.path.slice(backup.path.lastIndexOf('/') + 1)
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: remoteFileKey,
-        Body: backup.buffer,
-        ContentType: 'application/zip',
-      })
+      const pathParts = backup.path.split('/')
+      const remoteFileKey = `${pathParts.at(-2)}.zip`
+      this.logger.log('--> Starting upload to S3')
+      await s3
+        .uploadFile(backup.buffer, remoteFileKey, 'backup')
+        .catch((error) => {
+          this.logger.error('--> Upload failed')
+          throw error
+        })
 
-      this.logger.log('--> 开始上传到 S3')
-      await s3.send(command).catch((error) => {
-        this.logger.error('--> 上传失败了')
-        throw error
-      })
-      this.logger.log('--> 上传成功')
+      this.logger.log('--> Upload succeeded')
     })
   }
 }

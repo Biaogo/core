@@ -1,13 +1,12 @@
-import { isDefined } from 'class-validator'
-import { cloneDeep, isArrayLike, isObjectLike } from 'lodash'
-import { map } from 'rxjs'
 import type {
   CallHandler,
   ExecutionContext,
   NestInterceptor,
 } from '@nestjs/common'
-
 import { Injectable } from '@nestjs/common'
+import { isNotNil } from 'es-toolkit'
+import { cloneDeep, isArrayLike, isObjectLike } from 'es-toolkit/compat'
+import { map } from 'rxjs'
 
 import { getNestExecutionContextRequest } from '~/transformers/get-req.transformer'
 import { getAvatar } from '~/utils/tool.util'
@@ -16,7 +15,7 @@ import { getAvatar } from '~/utils/tool.util'
 export class CommentFilterEmailInterceptor implements NestInterceptor {
   intercept(context: ExecutionContext, next: CallHandler) {
     const request = this.getRequest(context)
-    // 如果已经登陆
+    // Already authenticated — skip filtering
     const isAuthenticated = request.user
     if (isAuthenticated) {
       return next.handle()
@@ -29,21 +28,17 @@ export class CommentFilterEmailInterceptor implements NestInterceptor {
         try {
           if (isArrayLike(data?.data)) {
             data?.data?.forEach((item: any, i: number) => {
-              // mongoose model -> object
-              data.data[i] = data.data[i].toObject?.() || data.data[i]
-              if (isDefined(item.mail)) {
+              if (isNotNil(item.mail)) {
                 data.data[i].avatar = getAvatar(item.mail)
                 delete data.data[i].mail
               }
-              if (item.children) {
-                handle({ data: data.data[i].children })
+              if (item.replies) {
+                handle({ data: data.data[i].replies })
               }
             })
           }
 
           if (isObjectLike(data)) {
-            data = data?.toJSON?.() || data
-
             Reflect.deleteProperty(data, 'mail')
           }
 

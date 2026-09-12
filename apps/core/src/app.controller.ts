@@ -1,5 +1,3 @@
-import dayjs from 'dayjs'
-
 import {
   BadRequestException,
   Get,
@@ -7,19 +5,19 @@ import {
   Post,
   UseInterceptors,
 } from '@nestjs/common'
+import dayjs from 'dayjs'
 
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import { InjectModel } from '~/transformers/model.transformer'
+import { PKG } from '~/utils/pkg.util'
 
-import PKG from '../package.json'
-import { DEMO_MODE } from './app.config'
 import { HttpCache } from './common/decorators/cache.decorator'
-import { HTTPDecorators } from './common/decorators/http.decorator'
-import { IpLocation, IpRecord } from './common/decorators/ip.decorator'
+import type { IpRecord } from './common/decorators/ip.decorator'
+import { IpLocation } from './common/decorators/ip.decorator'
 import { AllowAllCorsInterceptor } from './common/interceptors/allow-all-cors.interceptor'
 import { RedisKeys } from './constants/cache.constant'
-import { OptionModel } from './modules/configs/configs.model'
+import { isDev } from './global/env.global'
+import { ConfigsService } from './modules/configs/configs.service'
 import { RedisService } from './processors/redis/redis.service'
 import { getRedisKey } from './utils/redis.util'
 
@@ -27,13 +25,11 @@ import { getRedisKey } from './utils/redis.util'
 export class AppController {
   constructor(
     private readonly redisService: RedisService,
-    @InjectModel(OptionModel)
-    private readonly optionModel: MongooseModel<OptionModel>,
+    private readonly configsService: ConfigsService,
   ) {}
 
   @Get('/uptime')
   @HttpCache.disable
-  @HTTPDecorators.Bypass
   async getUptime() {
     const ts = (process.uptime() * 1000) | 0
     return {
@@ -48,7 +44,7 @@ export class AppController {
     return {
       name: PKG.name,
       author: PKG.author,
-      version: isDev ? 'dev' : `${DEMO_MODE ? 'demo/' : ''}${PKG.version}`,
+      version: isDev ? 'dev' : String(PKG.version),
       homepage: PKG.homepage,
       issues: PKG.issues,
     }
@@ -71,29 +67,18 @@ export class AppController {
       ip,
     )
     if (isLikedBefore) {
-      throw new BadRequestException('一天一次就够啦')
+      throw new BadRequestException('Once a day is enough')
     } else {
       redis.sadd(getRedisKey(RedisKeys.LikeSite), ip)
     }
 
-    await this.optionModel.updateOne(
-      {
-        name: 'like',
-      },
-      {
-        $inc: {
-          value: 1,
-        },
-      },
-      { upsert: true },
-    )
+    await this.configsService.incrementOption('like')
   }
 
   @Get('/like_this')
   @HttpCache.disable
   async getLikeNumber() {
-    const doc = await this.optionModel.findOne({ name: 'like' }).lean()
-    return doc ? doc.value : 0
+    return this.configsService.getOptionValue('like', 0)
   }
 
   @Get('/clean_catch')

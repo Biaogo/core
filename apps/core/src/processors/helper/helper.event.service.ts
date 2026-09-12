@@ -1,15 +1,14 @@
-import { merge } from 'lodash'
-import type { EventBusEvents } from '~/constants/event-bus.constant'
-
 import { Injectable, Logger } from '@nestjs/common'
 import { EventEmitter2 } from '@nestjs/event-emitter'
+import { merge } from 'es-toolkit/compat'
 
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
+import type { EventBusEvents } from '~/constants/event-bus.constant'
+import { RoomSubsService } from '~/processors/task-queue/task-queue.room-subs.service'
 import { scheduleManager } from '~/utils/schedule.util'
 
 import { AdminEventsGateway } from '../gateway/admin/events.gateway'
 import { BroadcastBaseGateway } from '../gateway/base.gateway'
-import { WebEventsGateway } from '../gateway/web/events.gateway'
 
 interface GatewayOption {
   rooms?: string[]
@@ -34,29 +33,40 @@ export class EventManagerService {
   }
 
   constructor(
-    private readonly webGateway: WebEventsGateway,
-
     private readonly adminGateway: AdminEventsGateway,
 
     private readonly emitter2: EventEmitter2,
+    private readonly roomSubs: RoomSubsService,
   ) {
     this.logger = new Logger(EventManagerService.name)
 
     this.listenSystemEvents()
   }
 
-  private mapScopeToInstance: Record<
-    EventScope,
-    (WebEventsGateway | AdminEventsGateway | EventEmitter2)[]
-  > = {
-    [EventScope.ALL]: [this.webGateway, this.adminGateway, this.emitter2],
-    [EventScope.TO_VISITOR]: [this.webGateway],
-    [EventScope.TO_ADMIN]: [this.adminGateway],
-    [EventScope.TO_SYSTEM]: [this.emitter2],
-    [EventScope.TO_VISITOR_ADMIN]: [this.webGateway, this.adminGateway],
+  async emitToAdminRoom(
+    event: BusinessEvents,
+    data: unknown,
+    room: string,
+  ): Promise<void> {
+    if (!(await this.roomSubs.has(room))) return
+    this.adminGateway.broadcast(event, data, { rooms: [room] })
+  }
 
-    [EventScope.TO_SYSTEM_VISITOR]: [this.emitter2, this.webGateway],
-    [EventScope.TO_SYSTEM_ADMIN]: [this.emitter2, this.adminGateway],
+  private get mapScopeToInstance(): Record<
+    EventScope,
+    (AdminEventsGateway | EventEmitter2)[]
+  > {
+    // Web visitor broadcasting is handled by VisitorEventDispatchService
+    // via registerHandler + scope check, not by direct gateway broadcast.
+    return {
+      [EventScope.ALL]: [this.adminGateway, this.emitter2],
+      [EventScope.TO_VISITOR]: [this.emitter2],
+      [EventScope.TO_ADMIN]: [this.adminGateway],
+      [EventScope.TO_SYSTEM]: [this.emitter2],
+      [EventScope.TO_VISITOR_ADMIN]: [this.adminGateway, this.emitter2],
+      [EventScope.TO_SYSTEM_VISITOR]: [this.emitter2],
+      [EventScope.TO_SYSTEM_ADMIN]: [this.emitter2, this.adminGateway],
+    }
   }
 
   #key = 'event-manager'
@@ -71,6 +81,7 @@ export class EventManagerService {
     data?: any,
     options?: EventManagerOptions,
   ): Promise<void>
+  emit(event: string, data?: any, options?: EventManagerOptions): Promise<void>
   async emit(event: string, data: any = null, _options?: EventManagerOptions) {
     const options = merge(
       {},
@@ -85,7 +96,6 @@ export class EventManagerService {
     const instances = this.mapScopeToInstance[scope]
 
     const tasks = Promise.all(
-      // eslint-disable-next-line array-callback-return
       instances.map((instance) => {
         if (instance instanceof EventEmitter2) {
           const isObjectLike = typeof data === 'object' && data !== null
@@ -111,7 +121,7 @@ export class EventManagerService {
     }
   }
 
-  // TODO 补充类型
+  // TODO add proper types
   on(
     event: BusinessEvents,
     handler: (data: any) => void,
@@ -158,7 +168,9 @@ export class EventManagerService {
   private listenSystemEvents() {
     this.emitter2.on(this.#key, (data) => {
       const { event, payload, scope } = data
-      console.debug(`[${scope}]: Received event: [${event}]`, payload)
+      this.logger.log(
+        `[scope=${scope}] event=[${event}] handlers=${this.#handlers.length}`,
+      )
 
       // emit current event directly
       this.emitter2.emit(event, payload)

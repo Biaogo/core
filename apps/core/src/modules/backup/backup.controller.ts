@@ -1,26 +1,23 @@
 import { Readable } from 'node:stream'
-import { FastifyRequest } from 'fastify'
 
 import {
-  BadRequestException,
   Body,
   Delete,
   Get,
   Header,
+  HttpCode,
   Param,
   Patch,
   Post,
   Query,
   Req,
-  UnprocessableEntityException,
 } from '@nestjs/common'
+import type { FastifyRequest } from 'fastify'
 
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import { BanInDemo } from '~/common/decorators/demo.decorator'
 import { HTTPDecorators } from '~/common/decorators/http.decorator'
-import { BizException } from '~/common/exceptions/biz.exception'
-import { ErrorCodeEnum } from '~/constants/error-code.constant'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { UploadService } from '~/processors/helper/helper.upload.service'
 import { isZipMinetype } from '~/utils/mine.util'
 import { getMediumDateTime } from '~/utils/time.util'
@@ -29,7 +26,6 @@ import { BackupService } from './backup.service'
 
 @ApiController({ path: 'backups' })
 @Auth()
-@BanInDemo
 export class BackupController {
   constructor(
     private readonly backupService: BackupService,
@@ -37,16 +33,21 @@ export class BackupController {
   ) {}
 
   @Get('/new')
+  @HTTPDecorators.RawResponse
   @Header(
     'Content-Disposition',
     `attachment; filename="backup-${getMediumDateTime(new Date())}.zip"`,
   )
   @Header('Content-Type', 'application/zip')
-  @HTTPDecorators.Bypass
   async createNewBackup() {
     const res = await this.backupService.backup()
-    if (typeof res == 'undefined' || typeof res.buffer === 'undefined') {
-      throw new BadRequestException('请先开启在设置开启备份功能')
+    if (typeof res == 'undefined') {
+      throw createAppException(AppErrorCode.BACKUP_NOT_ENABLED)
+    }
+    if (typeof res.buffer === 'undefined') {
+      throw createAppException(AppErrorCode.FILE_NOT_FOUND, {
+        extra: 'backup zip missing',
+      })
     }
     const stream = new Readable()
 
@@ -60,7 +61,7 @@ export class BackupController {
     return this.backupService.list()
   }
 
-  @HTTPDecorators.Bypass
+  @HTTPDecorators.RawResponse
   @Header('Content-Type', 'application/zip')
   @Get('/:dirname')
   async download(@Param('dirname') dirname: string) {
@@ -68,6 +69,7 @@ export class BackupController {
   }
 
   @Post(['/rollback/', '/'])
+  @HttpCode(200)
   async uploadAndRestore(@Req() req: FastifyRequest) {
     const data = await this.uploadService.getAndValidMultipartField(req, {
       maxFileSize: 1024 * 1024 * 100,
@@ -75,21 +77,22 @@ export class BackupController {
     const { mimetype } = data
 
     if (!isZipMinetype(mimetype)) {
-      throw new BizException(ErrorCodeEnum.MineZip, `got: ${mimetype}`)
+      throw createAppException(AppErrorCode.MIME_ZIP_REQUIRED, {
+        got: `got: ${mimetype}`,
+      })
     }
 
     await this.backupService.saveTempBackupByUpload(await data.toBuffer())
-
-    return
   }
   @Patch(['/rollback/:dirname', '/:dirname'])
   async rollback(@Param('dirname') dirname: string) {
     if (!dirname) {
-      throw new UnprocessableEntityException('参数有误')
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'dirname is required',
+      })
     }
 
     this.backupService.rollbackTo(dirname)
-    return
   }
 
   @Delete('/')
@@ -99,13 +102,14 @@ export class BackupController {
   ) {
     const nextFiles = files || filesBody
     if (!nextFiles) {
-      throw new UnprocessableEntityException('参数有误')
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'files is required',
+      })
     }
 
     const filesList = nextFiles.split(',')
 
     await Promise.all(filesList.map((f) => this.backupService.deleteBackup(f)))
-    return
   }
 
   @Delete('/:filename')
@@ -114,6 +118,11 @@ export class BackupController {
       return
     }
     await this.backupService.deleteBackup(filename)
-    return
+  }
+
+  @Post('/upload-to-s3')
+  @HttpCode(200)
+  async backupAndUploadToS3() {
+    this.backupService.backupDB()
   }
 }

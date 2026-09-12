@@ -1,0 +1,72 @@
+import { Injectable } from '@nestjs/common'
+
+import { ConfigsService } from '../configs/configs.service'
+import { MembershipRepository } from './membership.repository'
+import {
+  type MembershipAvailability,
+  resolveAppleIapAvailability,
+  resolveMembershipAvailability,
+} from './membership.types'
+
+@Injectable()
+export class EntitlementService {
+  constructor(
+    private readonly membershipRepository: MembershipRepository,
+    private readonly configsService: ConfigsService,
+  ) {}
+
+  async isActiveMember(readerId: string): Promise<boolean> {
+    const membership = await this.membershipRepository.findByReaderId(readerId)
+    if (!membership) return false
+    if (membership.status !== 'active' && membership.status !== 'on_hold')
+      return false
+    return membership.currentPeriodEnd.getTime() > Date.now()
+  }
+
+  async getActiveMemberIds(readerIds: string[]): Promise<Set<string>> {
+    const unique = [...new Set(readerIds.map(String))]
+    if (unique.length === 0) return new Set()
+    const rows = await this.membershipRepository.findByReaderIds(unique)
+    const now = Date.now()
+    const active = new Set<string>()
+    for (const row of rows) {
+      const entitled =
+        (row.status === 'active' || row.status === 'on_hold') &&
+        row.currentPeriodEnd.getTime() > now
+      if (entitled) active.add(String(row.readerId))
+    }
+    return active
+  }
+
+  async isEntitledToPremium(input: {
+    isOwner: boolean
+    readerId?: string
+  }): Promise<boolean> {
+    if (input.isOwner) return true
+    if (!input.readerId) return false
+    return this.isActiveMember(input.readerId)
+  }
+
+  async isPremiumLocked(input: {
+    isPremium?: boolean | null
+    isOwner: boolean
+    readerId?: string
+  }): Promise<boolean> {
+    if (!input.isPremium) return false
+    if (!(await this.isMembershipPurchasable())) return false
+    return !(await this.isEntitledToPremium(input))
+  }
+
+  async getAvailability(): Promise<MembershipAvailability> {
+    const config = await this.configsService.get('membership')
+    return resolveMembershipAvailability(config)
+  }
+
+  async isMembershipPurchasable(): Promise<boolean> {
+    const config = await this.configsService.get('membership')
+    return (
+      resolveMembershipAvailability(config).enabled ||
+      resolveAppleIapAvailability(config).enabled
+    )
+  }
+}

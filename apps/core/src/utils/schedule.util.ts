@@ -1,7 +1,7 @@
-import { sleep } from '@mx-space/compiled'
+import { delay } from 'es-toolkit'
 
 export function scheduleMicrotask(callback: () => void) {
-  sleep(0).then(callback)
+  delay(0).then(callback)
 }
 
 // TYPES

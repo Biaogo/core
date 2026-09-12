@@ -1,26 +1,54 @@
-import type { ModelWithLiked, TextBaseModel } from './base'
+import type { Image } from './base'
+import type { EnrichmentResult } from './enrichment'
 import type { TopicModel } from './topic'
 
-export interface NoteModel extends TextBaseModel {
-  hide: boolean
-  count: {
-    read: number
-    like: number
-  }
+export type NoteEnrichmentMap = Record<string, EnrichmentResult>
 
-  mood?: string
-  weather?: string
-  bookmark?: boolean
-
-  publicAt?: Date
-  password?: string | null
+export interface NoteModel {
+  id: string
   nid: number
+  title: string
+  slug?: string | null
+  text: string
+  content?: string | null
+  contentFormat: 'markdown' | 'lexical'
+  images?: Image[] | null
+  meta?: Record<string, any> | null
 
-  location?: string
+  isPublished: boolean
+  hasPassword: boolean
+  publicAt?: string | Date | null
 
-  coordinates?: Coordinate
-  topic?: TopicModel
-  topicId?: string
+  mood?: string | null
+  weather?: string | null
+  bookmark: boolean
+
+  coordinates?: Coordinate | null
+  location?: string | null
+
+  readCount: number
+  likeCount: number
+
+  topicId?: string | null
+  topic?: TopicModel | null
+
+  createdAt: string
+  modifiedAt: string | null
+
+  /**
+   * Server-injected only when the list endpoint is called with
+   * `?withSummary=1`. Falls back to the first 150 chars of `text` if the AI
+   * summary cache misses. Absent on detail endpoints.
+   */
+  summary?: string
+
+  /**
+   * Server-injected only on detail endpoints. Bulk pre-resolved enrichments
+   * for URLs found in the body. Frontend renders link cards inline without
+   * extra fetches when present; cache misses fall through to
+   * `/enrichment/resolve`.
+   */
+  enrichments?: NoteEnrichmentMap
 }
 
 export interface Coordinate {
@@ -28,14 +56,7 @@ export interface Coordinate {
   longitude: number
 }
 
-export interface NoteWrappedPayload {
-  data: NoteModel
-  next?: Partial<NoteModel>
-  prev?: Partial<NoteModel>
-}
-
-export interface NoteWrappedWithLikedPayload {
-  data: ModelWithLiked<NoteModel>
-  next?: Partial<NoteModel>
-  prev?: Partial<NoteModel>
+export type NoteWrappedPayload = NoteModel & {
+  next?: Partial<NoteModel> | null
+  prev?: Partial<NoteModel> | null
 }

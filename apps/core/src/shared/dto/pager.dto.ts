@@ -1,91 +1,47 @@
-import { Expose, Transform } from 'class-transformer'
-import {
-  IsEnum,
-  IsInt,
-  IsMongoId,
-  IsNotEmpty,
-  IsOptional,
-  IsString,
-  Max,
-  Min,
-  ValidateIf,
-} from 'class-validator'
+import { z } from 'zod'
 
-class DbQueryDto {
-  @IsOptional()
-  db_query?: any
-}
-export class PagerDto extends DbQueryDto {
-  @Min(1)
-  @Max(50)
-  @IsInt()
-  @Expose()
-  @Transform(({ value: val }) => (val ? Number.parseInt(val) : 10), {
-    toClassOnly: true,
+import { zCoerceInt, zEntityId, zSortOrder } from '~/common/zod'
+
+/**
+ * Base pager — page + size + optional view. No sort fields.
+ *
+ * Use this when an endpoint does not expose sortable columns.
+ * If sorting is supported, use {@link createPagerSchema} instead so the sort
+ * keys are explicit and type-safe.
+ */
+export const BasicPagerSchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  size: z.coerce.number().int().positive().max(100).default(10),
+  view: z.string().optional(),
+})
+
+export type BasicPagerDto = z.infer<typeof BasicPagerSchema>
+
+export type BasicPagerInput = z.infer<typeof BasicPagerSchema>
+
+/**
+ * Sort-aware pager factory. Pass the column names this endpoint is allowed to
+ * sort by; the resulting schema exposes `sortBy` (typed as `z.enum(sortKeys)`)
+ * and `sortOrder` (`'asc' | 'desc'`, default `'desc'`) inside core. On the
+ * wire both `sortBy=`/`sort_by=` are accepted (the global request-case
+ * normalization pipe folds snake_case query keys to camelCase before zod), and
+ * the legacy `1` / `-1` sortOrder values are coerced to `'asc'` / `'desc'`.
+ */
+export const createPagerSchema = <TSort extends [string, ...string[]]>(
+  sortKeys: TSort,
+) =>
+  BasicPagerSchema.extend({
+    sortBy: z.enum(sortKeys).optional(),
+    sortOrder: zSortOrder,
+    year: z.coerce.number().int().optional(),
   })
-  size: number
 
-  @Transform(({ value: val }) => (val ? Number.parseInt(val) : 1), {
-    toClassOnly: true,
-  })
-  @Min(1)
-  @IsInt()
-  @Expose()
-  page: number
+export const OffsetSchema = z.object({
+  before: zEntityId.optional(),
+  after: zEntityId.optional(),
+  size: zCoerceInt.max(50).optional(),
+})
 
-  @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  select?: string
+export type OffsetDto = z.infer<typeof OffsetSchema>
 
-  @IsOptional()
-  @IsString()
-  sortBy?: string
-
-  @IsOptional()
-  @IsEnum([1, -1])
-  @Transform(({ value: val }) => {
-    // @ts-ignore
-    const isStringNumber = typeof val === 'string' && !Number.isNaN(val)
-
-    if (isStringNumber) {
-      return Number.parseInt(val)
-    } else {
-      return {
-        asc: 1,
-        desc: -1,
-      }[val.toString()]
-    }
-  })
-  sortOrder?: 1 | -1
-
-  @IsOptional()
-  @Transform(({ value: val }) => Number.parseInt(val))
-  @Min(1)
-  @IsInt()
-  year?: number
-
-  @IsOptional()
-  @Transform(({ value: val }) => Number.parseInt(val))
-  @IsInt()
-  state?: number
-}
-
-export class OffsetDto {
-  @IsMongoId()
-  @IsOptional()
-  before?: string
-
-  @IsMongoId()
-  @IsOptional()
-  @ValidateIf((o) => {
-    return typeof o.before !== 'undefined'
-  })
-  after?: string
-
-  @Transform(({ value }) => +value)
-  @IsInt()
-  @IsOptional()
-  @Max(50)
-  size?: number
-}
+export type OffsetInput = z.infer<typeof OffsetSchema>

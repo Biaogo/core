@@ -1,17 +1,18 @@
-/* eslint-disable dot-notation */
-// @reference https://github.com/ever-co/ever-gauzy/blob/d36b4f40b1446f3c33d02e0ba00b53a83109d950/packages/core/src/core/context/request-context.ts
-import * as cls from 'cls-hooked'
-import type { UserModel } from '~/modules/user/user.model'
-import type { BizIncomingMessage } from '~/transformers/get-req.transformer'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { ServerResponse } from 'node:http'
-
 import { UnauthorizedException } from '@nestjs/common'
+import type { SessionUser } from '~/modules/auth/auth.types'
+import type { BizIncomingMessage } from '~/transformers/get-req.transformer'
 
 type Nullable<T> = T | null
+
 export class RequestContext {
+  private static readonly storage = new AsyncLocalStorage<RequestContext>()
+
   readonly id: number
   request: BizIncomingMessage
   response: ServerResponse
+  lang?: string
 
   constructor(request: BizIncomingMessage, response: ServerResponse) {
     this.id = Math.random()
@@ -19,34 +20,23 @@ export class RequestContext {
     this.response = response
   }
 
-  static currentRequestContext(): Nullable<RequestContext> {
-    const session = cls.getNamespace(RequestContext.name)
-    if (session && session.active) {
-      return session.get(RequestContext.name)
-    }
+  static run<T>(requestContext: RequestContext, callback: () => T): T {
+    return RequestContext.storage.run(requestContext, callback)
+  }
 
-    return null
+  static currentRequestContext(): Nullable<RequestContext> {
+    return RequestContext.storage.getStore() ?? null
   }
 
   static currentRequest(): Nullable<BizIncomingMessage> {
-    const requestContext = RequestContext.currentRequestContext()
-
-    if (requestContext) {
-      return requestContext.request
-    }
-
-    return null
+    return RequestContext.currentRequestContext()?.request ?? null
   }
 
-  static currentUser(throwError?: boolean): Nullable<UserModel> {
-    const requestContext = RequestContext.currentRequestContext()
+  static currentUser(throwError?: boolean): Nullable<SessionUser> {
+    const user = RequestContext.currentRequestContext()?.request.user
 
-    if (requestContext) {
-      const user = requestContext.request['user']
-
-      if (user) {
-        return user
-      }
+    if (user) {
+      return user
     }
 
     if (throwError) {
@@ -56,17 +46,33 @@ export class RequestContext {
     return null
   }
 
-  static currentIsAuthenticated() {
-    const requestContext = RequestContext.currentRequestContext()
+  static currentReaderId(): string | null {
+    return RequestContext.currentRequestContext()?.request.readerId ?? null
+  }
 
-    if (requestContext) {
-      const isAuthenticated =
-        requestContext.request['isAuthenticated'] ||
-        requestContext.request['isAuthenticated']
+  static currentAuthProvider(): string | null {
+    return RequestContext.currentRequestContext()?.request.authProvider ?? null
+  }
 
-      return !!isAuthenticated
+  static hasReaderIdentity(): boolean {
+    const request = RequestContext.currentRequestContext()?.request
+    return !!(request?.hasReaderIdentity ?? request?.readerId)
+  }
+
+  static hasAdminAccess(): boolean {
+    const request = RequestContext.currentRequestContext()?.request
+    return !!(request?.hasAdminAccess ?? request?.isAuthenticated)
+  }
+
+  static currentIsGuest(): boolean {
+    const request = RequestContext.currentRequestContext()?.request
+    if (!request) {
+      return true
     }
+    return request.isGuest ?? !RequestContext.hasReaderIdentity()
+  }
 
-    return false
+  static currentLang(): string | undefined {
+    return RequestContext.currentRequestContext()?.lang
   }
 }

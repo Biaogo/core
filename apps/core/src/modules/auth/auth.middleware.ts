@@ -1,16 +1,20 @@
-import type { BetterAuthOptions } from '@mx-space/compiled/auth'
-import type { NestMiddleware, OnModuleInit } from '@nestjs/common'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+import type { NestMiddleware, OnModuleInit } from '@nestjs/common'
 import { Inject } from '@nestjs/common'
 
-import { EventBusEvents } from '~/constants/event-bus.constant'
-import { SubPubBridgeService } from '~/processors/redis/subpub.service'
+import {
+  ConfigVersionScopes,
+  ConfigVersionService,
+} from '~/processors/redis/config-version.service'
+import { SnowflakeService } from '~/shared/id/snowflake.service'
 
 import { ConfigsService } from '../configs/configs.service'
 import { AuthInstanceInjectKey } from './auth.constant'
 import { CreateAuth } from './auth.implement'
-import { InjectAuthInstance } from './auth.interface'
+import type { InjectAuthInstance } from './auth.interface'
+import { ReviewDemoService } from './review-demo.service'
+import { buildSocialProviders } from './social-providers'
 
 declare module 'http' {
   interface IncomingMessage {
@@ -20,60 +24,82 @@ declare module 'http' {
 
 export class AuthMiddleware implements NestMiddleware, OnModuleInit {
   private authHandler: Awaited<ReturnType<typeof CreateAuth>>['handler']
+  private reloadPromise?: Promise<void>
+  private readonly appliedVersions = {
+    [ConfigVersionScopes.OAuth]: 0,
+    [ConfigVersionScopes.Url]: 0,
+  }
 
   constructor(
-    private readonly redisSub: SubPubBridgeService,
+    private readonly configVersionService: ConfigVersionService,
     private readonly configService: ConfigsService,
     @Inject(AuthInstanceInjectKey)
     private readonly authInstance: InjectAuthInstance,
+    private readonly snowflakeService: SnowflakeService,
+    private readonly reviewDemoService: ReviewDemoService,
   ) {}
 
   async onModuleInit() {
-    const handler = async () => {
+    await this.ensureAuthHandlerFresh(true)
+  }
+
+  private async ensureAuthHandlerFresh(force = false) {
+    const currentVersions = await this.configVersionService.getVersions(
+      [ConfigVersionScopes.OAuth, ConfigVersionScopes.Url] as const,
+      this.appliedVersions,
+    )
+    const isStale =
+      force ||
+      !this.authHandler ||
+      currentVersions.oauth !== this.appliedVersions.oauth ||
+      currentVersions.url !== this.appliedVersions.url
+
+    if (!isStale) {
+      return
+    }
+
+    if (this.reloadPromise) {
+      await this.reloadPromise
+      return
+    }
+
+    this.reloadPromise = (async () => {
       const oauth = await this.configService.get('oauth')
+      const urls = await this.configService.get('url')
 
-      const providers = {} as NonNullable<BetterAuthOptions['socialProviders']>
-      oauth.providers.forEach((provider) => {
-        if (!provider.enabled) return
-        const type = provider.type as string
+      const providers = buildSocialProviders(oauth, urls.serverUrl)
 
-        const mergedConfig = {
-          ...oauth.public[type],
-          ...oauth.secrets[type],
-        }
-        switch (type) {
-          case 'github': {
-            if (!mergedConfig.clientId || !mergedConfig.clientSecret) return
+      const parsedAdminUrl = new URL(urls.adminUrl)
+      const passkeyOptions = {
+        rpID: parsedAdminUrl.hostname,
+        rpName: 'MixSpace',
+        origin: isDev
+          ? [
+              parsedAdminUrl.origin,
+              'http://localhost:9528',
+              'http://127.0.0.1:9528',
+              'http://localhost:2323',
+              'http://127.0.0.1:2323',
+            ]
+          : parsedAdminUrl.origin,
+      }
 
-            providers.github = {
-              clientId: mergedConfig.clientId,
-              clientSecret: mergedConfig.clientSecret,
-            }
-            break
-          }
-
-          case 'google': {
-            if (!mergedConfig.clientId || !mergedConfig.clientSecret) return
-
-            providers.google = {
-              clientId: mergedConfig.clientId,
-              clientSecret: mergedConfig.clientSecret,
-            }
-
-            break
-          }
-        }
-      })
-
-      const { handler, auth } = await CreateAuth(providers)
+      const { handler, auth } = await CreateAuth(
+        providers,
+        passkeyOptions,
+        urls.serverUrl,
+        this.snowflakeService,
+        () => this.reviewDemoService.getCredentialSignInGate(),
+      )
       this.authHandler = handler
 
       this.authInstance.set(auth)
-    }
-    this.redisSub.subscribe(EventBusEvents.OauthChanged, handler)
-    this.redisSub.subscribe(EventBusEvents.AppUrlChanged, handler)
+      Object.assign(this.appliedVersions, currentVersions)
+    })().finally(() => {
+      this.reloadPromise = undefined
+    })
 
-    await handler()
+    await this.reloadPromise
   }
 
   async use(req: IncomingMessage, res: ServerResponse, next: () => void) {
@@ -82,9 +108,7 @@ export class AuthMiddleware implements NestMiddleware, OnModuleInit {
       return
     }
 
-    const bypassPath = ['/token', '/session', '/providers']
-
-    if (bypassPath.some((path) => req.originalUrl.includes(path))) {
+    if (shouldBypassBetterAuth(req.originalUrl)) {
       next()
       return
     }
@@ -93,6 +117,13 @@ export class AuthMiddleware implements NestMiddleware, OnModuleInit {
       return
     }
 
+    await this.ensureAuthHandlerFresh()
+
     return await this.authHandler(req, res)
   }
+}
+
+export function shouldBypassBetterAuth(originalUrl: string) {
+  const pathname = originalUrl.split('?')[0]?.replace(/\/+$/, '') || ''
+  return /\/auth\/(?:token|session|providers|review-demo)$/.test(pathname)
 }

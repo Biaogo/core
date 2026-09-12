@@ -1,0 +1,75 @@
+import { z } from 'zod'
+
+import { zEmail, zHttpsUrl, zMaxLengthString } from '~/common/zod'
+import { BasicPagerSchema } from '~/shared/dto/pager.dto'
+
+import { LinkState, LinkType } from './link.enum'
+
+/**
+ * Link schema for API validation
+ */
+export const LinkSchema = z.object({
+  name: zMaxLengthString(20, 'Title is too long'),
+  url: zHttpsUrl,
+  avatar: z
+    .preprocess(
+      (val) => (val === '' ? null : val),
+      z.string().url().max(200).nullable(),
+    )
+    .optional(),
+  description: zMaxLengthString(
+    50,
+    'Description must not exceed 50 characters',
+  ).optional(),
+  type: z.enum(LinkType).default(LinkType.Friend).optional(),
+  state: z.enum(LinkState).default(LinkState.Pass).optional(),
+  email: z
+    .preprocess(
+      (val) => (val === '' ? null : val),
+      zEmail('Please enter a valid email address').max(50).nullable(),
+    )
+    .optional(),
+})
+
+export type LinkSchemaDto = z.infer<typeof LinkSchema>
+
+/**
+ * Link DTO with author field (for guest submissions)
+ */
+export const LinkWithAuthorSchema = LinkSchema.extend({
+  author: zMaxLengthString(20, 'Your name is too long'),
+})
+
+export type LinkDto = z.infer<typeof LinkWithAuthorSchema>
+
+/**
+ * Partial link schema for PATCH operations
+ */
+export const PartialLinkSchema = LinkSchema.partial()
+
+export type PartialLinkDto = z.infer<typeof PartialLinkSchema>
+
+/**
+ * Audit reason schema
+ */
+export const AuditReasonSchema = z.object({
+  reason: z.string().min(1, 'Please enter an audit reason'),
+  state: z.enum(LinkState),
+})
+
+export type AuditReasonDto = z.infer<typeof AuditReasonSchema>
+
+/**
+ * Link list pager — basic pager plus optional `state` filter.
+ */
+export const LinkPagerSchema = BasicPagerSchema.extend({
+  state: z.coerce.number().int().optional(),
+})
+
+export type LinkPagerDto = z.infer<typeof LinkPagerSchema>
+
+// Type exports
+export type LinkInput = z.infer<typeof LinkSchema>
+export type LinkWithAuthorInput = z.infer<typeof LinkWithAuthorSchema>
+export type PartialLinkInput = z.infer<typeof PartialLinkSchema>
+export type AuditReasonInput = z.infer<typeof AuditReasonSchema>

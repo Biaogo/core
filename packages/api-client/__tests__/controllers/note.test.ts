@@ -22,14 +22,17 @@ describe('test note client', () => {
   })
 
   it('should get post list filter filed', async () => {
-    const mocked = mockResponse('/notes?page=1&size=1&select=created+title', {
-      data: [{}],
+    const items = [{}]
+    const pagination = { page: 1, size: 1, total: 1, total_pages: 1 }
+    mockResponse('/notes?page=1&size=1', items, 'get', undefined, {
+      pagination,
     })
 
-    const data = await client.note.getList(1, 1, {
-      select: ['created', 'title'],
+    const data = await client.note.getList(1, 1)
+    expect(data).toEqual({
+      data: items,
+      pagination: { page: 1, size: 1, total: 1, totalPages: 1 },
     })
-    expect(data).toEqual(mocked)
   })
 
   it('should get latest note', async () => {
@@ -43,9 +46,11 @@ describe('test note client', () => {
       data: [
         {
           id: '1',
+          slug: 'note-1',
         },
         {
           id: '2',
+          slug: 'note-2',
         },
       ],
       size: 2,
@@ -55,9 +60,11 @@ describe('test note client', () => {
       data: [
         {
           id: '1',
+          slug: 'note-1',
         },
         {
           id: '2',
+          slug: 'note-2',
         },
       ],
       size: 2,
@@ -87,6 +94,13 @@ describe('test note client', () => {
     expect(data.title).toBe('1')
   })
 
+  it('should get note by date and slug', async () => {
+    mockResponse('/notes/2023/1/17/note-2', { data: { title: '1' } })
+
+    const data = await client.note.getNoteBySlugDate(2023, 1, 17, 'note-2')
+    expect(data.data.title).toBe('1')
+  })
+
   it('should forbidden if no password provide', async () => {
     spyOn(axiosAdaptor, 'get').mockRejectedValue({
       response: {
@@ -108,5 +122,15 @@ describe('test note client', () => {
     const data = await client.note.getNoteByTopicId('11111111')
 
     expect(data).toEqual({ data: [], pagination: {} })
+  })
+
+  test('GET /notes/topics/:id/recent-update', async () => {
+    mockResponse('/notes/topics/11111111/recent-update', {
+      ts: '2025-10-19T14:57:30.803Z',
+    })
+
+    const data = await client.note.getTopicRecentUpdate('11111111')
+
+    expect(data).toEqual({ ts: '2025-10-19T14:57:30.803Z' })
   })
 })

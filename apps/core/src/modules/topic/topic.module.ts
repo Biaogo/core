@@ -1,11 +1,13 @@
-import { Module } from '@nestjs/common'
+import { forwardRef, Module } from '@nestjs/common'
 
+import { AiModule } from '../ai/ai.module'
 import { TopicBaseController } from './topic.controller'
-import { TopicService } from './topic.service'
+import { TopicRepository } from './topic.repository'
 
 @Module({
+  imports: [forwardRef(() => AiModule)],
   controllers: [TopicBaseController],
-  exports: [TopicService],
-  providers: [TopicService],
+  providers: [TopicRepository],
+  exports: [TopicRepository],
 })
 export class TopicModule {}

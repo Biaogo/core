@@ -1,185 +1,197 @@
 import { URL } from 'node:url'
 
-import {
-  BadRequestException,
-  Injectable,
-  Logger,
-  NotFoundException,
-  UnprocessableEntityException,
-} from '@nestjs/common'
+import { Injectable, Logger } from '@nestjs/common'
 
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { isDev } from '~/global/env.global'
+import { AgentBrowserService } from '~/processors/agent-browser/agent-browser.service'
 import { EmailService } from '~/processors/helper/helper.email.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
-import { HttpService } from '~/processors/helper/helper.http.service'
-import { InjectModel } from '~/transformers/model.transformer'
 import { scheduleManager } from '~/utils/schedule.util'
 
 import { ConfigsService } from '../configs/configs.service'
-import { UserService } from '../user/user.service'
+import { OwnerService } from '../owner/owner.service'
+import { LinkRepository } from './link.repository'
+import { type LinkRow, LinkState, LinkType } from './link.types'
+import { LinkAvatarService } from './link-avatar.service'
 import { LinkApplyEmailType } from './link-mail.enum'
-import { LinkModel, LinkState, LinkStateMap, LinkType } from './link.model'
+
+const LinkStateMap: Record<LinkState, string> = {
+  [LinkState.Pass]: 'Approved',
+  [LinkState.Audit]: 'Under review',
+  [LinkState.Outdate]: 'Outdated',
+  [LinkState.Banned]: 'Banned',
+  [LinkState.Reject]: 'Rejected',
+}
 
 @Injectable()
 export class LinkService {
-  constructor(
-    @InjectModel(LinkModel)
-    private readonly linkModel: MongooseModel<LinkModel>,
-    private readonly emailService: EmailService,
-    private readonly configs: ConfigsService,
+  private readonly logger = new Logger(LinkService.name)
 
-    private readonly userService: UserService,
-    private readonly eventManager: EventManagerService,
-    private readonly http: HttpService,
+  constructor(
+    private readonly linkRepository: LinkRepository,
+    private readonly emailService: EmailService,
     private readonly configsService: ConfigsService,
+    private readonly ownerService: OwnerService,
+    private readonly eventManager: EventManagerService,
+    private readonly agentBrowser: AgentBrowserService,
+    private readonly linkAvatarService: LinkAvatarService,
   ) {}
 
-  public get model() {
-    return this.linkModel
+  public get repository() {
+    return this.linkRepository
   }
-  async applyForLink(model: LinkModel) {
+
+  list(page: number, size: number, state?: LinkState) {
+    return this.linkRepository.list(page, size, { state })
+  }
+
+  findAvailable() {
+    return this.linkRepository.findAvailable()
+  }
+
+  countByState(state: LinkState) {
+    return this.linkRepository.countByState(state)
+  }
+
+  async applyForLink(input: {
+    url: string
+    name: string
+    avatar?: string | null
+    description?: string | null
+    email?: string | null
+    author?: string | null
+  }) {
     const { allowSubPath } = await this.configsService.get('friendLinkOptions')
 
-    const existedDoc = await this.model
-      .findOne({
-        $or: [{ url: model.url }, { name: model.name }],
-      })
-      .lean()
+    const existed = await this.linkRepository.findByUrlOrName(
+      input.url,
+      input.name,
+    )
 
-    let nextModel: LinkModel | null
-    if (existedDoc) {
-      switch (existedDoc.state) {
+    let nextLink: LinkRow | null = null
+    if (existed) {
+      switch (existed.state) {
         case LinkState.Pass:
-        case LinkState.Audit:
-          throw new BadRequestException('请不要重复申请友链哦')
-
-        case LinkState.Banned:
-          throw new BadRequestException('您的友链已被禁用，请联系管理员')
+        case LinkState.Audit: {
+          throw createAppException(AppErrorCode.DUPLICATE_LINK)
+        }
+        case LinkState.Banned: {
+          throw createAppException(AppErrorCode.LINK_DISABLED)
+        }
         case LinkState.Reject:
-        case LinkState.Outdate:
-          nextModel = await this.model
-            .findOneAndUpdate(
-              { _id: existedDoc._id },
-              {
-                $set: {
-                  state: LinkState.Audit,
-                },
-              },
-              { new: true },
-            )
-            .lean()
+        case LinkState.Outdate: {
+          nextLink = await this.linkRepository.updateState(
+            existed.id,
+            LinkState.Audit,
+          )
+          break
+        }
       }
     } else {
-      const url = new URL(model.url)
+      const url = new URL(input.url)
       const pathname = url.pathname
-
       if (pathname !== '/' && !allowSubPath) {
-        throw new UnprocessableEntityException('管理员当前禁用了子路径友链申请')
+        throw createAppException(AppErrorCode.SUBPATH_LINK_DISABLED)
       }
-
-      nextModel = await this.model.create({
-        ...model,
+      nextLink = await this.linkRepository.create({
+        name: input.name,
         url: allowSubPath ? `${url.origin}${url.pathname}` : url.origin,
+        avatar: input.avatar ?? null,
+        description: input.description ?? null,
+        email: input.email ?? null,
         type: LinkType.Friend,
         state: LinkState.Audit,
       })
     }
 
     scheduleManager.schedule(() => {
-      this.eventManager.broadcast(BusinessEvents.LINK_APPLY, nextModel, {
+      this.eventManager.broadcast(BusinessEvents.LINK_APPLY, nextLink, {
         scope: EventScope.TO_SYSTEM_ADMIN,
       })
     })
   }
 
   async approveLink(id: string) {
-    const doc = await this.model
-      .findOneAndUpdate(
-        { _id: id },
-        {
-          $set: { state: LinkState.Pass },
-        },
-      )
-      .lean()
-
-    if (!doc) {
-      throw new NotFoundException()
+    const updated = await this.linkRepository.updateState(id, LinkState.Pass)
+    if (!updated) {
+      throw createAppException(AppErrorCode.LINK_NOT_FOUND, { id })
     }
-
-    return doc
+    const convertedAvatar =
+      await this.linkAvatarService.convertToInternal(updated)
+    return { link: updated, convertedAvatar }
   }
 
   async getCount() {
     const [audit, friends, collection, outdate, banned, reject] =
       await Promise.all([
-        this.model.countDocuments({ state: LinkState.Audit }),
-        this.model.countDocuments({
-          type: LinkType.Friend,
-          state: LinkState.Pass,
-        }),
-        this.model.countDocuments({
-          type: LinkType.Collection,
-        }),
-        this.model.countDocuments({
-          state: LinkState.Outdate,
-        }),
-        this.model.countDocuments({
-          state: LinkState.Banned,
-        }),
-        this.model.countDocuments({
-          state: LinkState.Reject,
-        }),
+        this.linkRepository.countByState(LinkState.Audit),
+        this.linkRepository.countByTypeAndState(
+          LinkType.Friend,
+          LinkState.Pass,
+        ),
+        this.linkRepository.countByType(LinkType.Collection),
+        this.linkRepository.countByState(LinkState.Outdate),
+        this.linkRepository.countByState(LinkState.Banned),
+        this.linkRepository.countByState(LinkState.Reject),
       ])
-    return {
-      audit,
-      friends,
-      collection,
-      outdate,
-      banned,
-      reject,
-    }
+    return { audit, friends, collection, outdate, banned, reject }
   }
 
-  async sendToCandidate(model: LinkModel) {
-    if (!model.email) {
-      return
-    }
-    const { enable } = await this.configs.get('mailOptions')
+  async sendToCandidate(model: LinkRow) {
+    if (!model.email) return
+    const { enable } = await this.configsService.get('mailOptions')
     if (!enable || isDev) {
       console.info(`
       To: ${model.email}
-      你的友链已通过
-        站点标题：${model.name}
-        站点网站：${model.url}
-        站点描述：${model.description}`)
+      Your friend link has been approved
+        Site title: ${model.name}
+        Site URL: ${model.url}
+        Site description: ${model.description}`)
       return
     }
-
     await this.sendLinkApplyEmail({
       model,
       to: model.email,
       template: LinkApplyEmailType.ToCandidate,
     })
   }
-  async sendToMaster(authorName: string, model: LinkModel) {
-    const enable = (await this.configs.get('mailOptions')).enable
+
+  async sendToOwner(authorName: string, model: LinkRow) {
+    const { enable } = await this.configsService.get('mailOptions')
     if (!enable || isDev) {
-      console.info(`来自 ${authorName} 的友链请求：
-        站点标题：${model.name}
-        站点网站：${model.url}
-        站点描述：${model.description}`)
+      console.info(`New friend link request from ${authorName}:
+        Site title: ${model.name}
+        Site URL: ${model.url}
+        Site description: ${model.description}`)
       return
     }
     scheduleManager.schedule(async () => {
-      const master = await this.userService.getMaster()
-
+      const owner = await this.ownerService.getOwner()
+      if (!owner.mail) return
       await this.sendLinkApplyEmail({
         authorName,
         model,
-        to: master.mail,
-        template: LinkApplyEmailType.ToMaster,
+        to: owner.mail,
+        template: LinkApplyEmailType.ToOwner,
       })
+    })
+  }
+
+  private async sendLinkMail(
+    to: string,
+    subject: string,
+    text: string,
+  ): Promise<void> {
+    const { seo, mailOptions } = await this.configsService.waitForConfigReady()
+    const senderEmail = mailOptions.from || mailOptions.smtp?.user
+    const sendfrom = `"${seo.title || 'Mix Space'}" <${senderEmail}>`
+    await this.emailService.send({
+      from: sendfrom,
+      to,
+      subject,
+      text,
     })
   }
 
@@ -191,100 +203,81 @@ export class LinkService {
   }: {
     authorName?: string
     to: string
-    model: LinkModel
+    model: LinkRow
     template: LinkApplyEmailType
   }) {
-    const { seo, mailOptions } = await this.configsService.waitForConfigReady()
-    const { from, user } = mailOptions
-    const sendfrom = `"${seo.title || 'Mx Space'}" <${from || user}>`
-    await this.emailService.getInstance().sendMail({
-      from: sendfrom,
-      to,
-      subject:
-        template === LinkApplyEmailType.ToMaster
-          ? `[${seo.title || 'Mx Space'}] 新的朋友 ${authorName}`
-          : `嘿!~, 主人已通过你的友链申请!~`,
-      text:
-        template === LinkApplyEmailType.ToMaster
-          ? `来自 ${model.name} 的友链请求：
-          站点标题：${model.name}
-          站点网站：${model.url}
-          站点描述：${model.description}
+    const { seo } = await this.configsService.waitForConfigReady()
+    const siteTitle = seo.title || 'Mix Space'
+    const isToOwner = template === LinkApplyEmailType.ToOwner
+    const subject = isToOwner
+      ? `[${siteTitle}] New friend ${authorName}`
+      : `Hey! Your friend link application has been approved`
+    const text = isToOwner
+      ? `New friend link request from ${model.name}:
+          Site title: ${model.name}
+          Site URL: ${model.url}
+          Site description: ${model.description}
         `
-          : `你的友链申请：${model.name}, ${model.url} 已通过`,
-    })
+      : `Your friend link application: ${model.name}, ${model.url} has been approved`
+    await this.sendLinkMail(to, subject, text)
   }
 
-  /** 确定友链存活状态 */
   async checkLinkHealth() {
-    const links = await this.model.find({ state: LinkState.Pass })
-    const health = await Promise.all(
-      links.map(({ id, url }) => {
-        Logger.debug(
-          `检查友链 ${id} 的健康状态：GET -> ${url}`,
-          LinkService.name,
+    const links = await this.linkRepository.findByState(LinkState.Pass)
+    // Probe through the shared agent-browser pool so JS-rendered landing
+    // pages, anti-bot challenges, and client-side redirects no longer look
+    // dead to us. The pool acts as a concurrency semaphore — `Promise.all`
+    // below queues at the pool, it does not fork one chromium per link.
+    const results = await Promise.all(
+      links.map(async ({ id, url }) => {
+        this.logger.debug(
+          `Checking friend link ${id} health via agent-browser -> ${url}`,
         )
-        return this.http.axiosRef
-          .get(url, {
-            timeout: 5000,
-            'axios-retry': {
-              retries: 1,
-              shouldResetTimeout: true,
-            },
-          })
-          .then((res) => {
-            return {
-              status: res.status,
-              id,
-            }
-          })
-          .catch((error) => {
-            return {
-              id,
-              status: error.response?.status || 'ERROR',
-              message: error.message,
-            }
-          })
+        const probe = await this.agentBrowser.checkUrl(url, {
+          timeoutMs: 15_000,
+        })
+        if (probe.ok) {
+          return { id, status: probe.status ?? 200, finalUrl: probe.finalUrl }
+        }
+        return {
+          id,
+          status: probe.status ?? 'ERROR',
+          message: probe.error,
+          finalUrl: probe.finalUrl,
+        }
       }),
-    ).then((arr) =>
-      arr.reduce((acc, cur) => {
-        acc[cur.id] = cur
-        return acc
-      }, {}),
     )
-
-    return health
+    const map: Record<string, unknown> = {}
+    for (const result of results) map[result.id] = result
+    return map
   }
 
   async canApplyLink() {
-    const configs = await this.configs.get('friendLinkOptions')
-    const can = configs.allowApply
-    return can
+    const { allowApply } = await this.configsService.get('friendLinkOptions')
+    return allowApply
   }
 
   async sendAuditResultByEmail(id: string, reason: string, state: LinkState) {
-    const doc = await this.model.findById(id)
-    if (!doc) {
-      throw new NotFoundException()
+    const updated = await this.linkRepository.updateState(id, state)
+    if (!updated) {
+      throw createAppException(AppErrorCode.LINK_NOT_FOUND, { id })
     }
 
-    doc.state = state
-    await doc.save()
-
-    const { seo, mailOptions } = await this.configsService.waitForConfigReady()
-    const { enable } = mailOptions
+    const { enable } = await this.configsService.get('mailOptions')
     if (!enable || isDev) {
-      console.log(`友链结果通知：${reason}, 状态：${state}`)
+      console.info(`Friend link audit result: ${reason}, state: ${state}`)
       return
     }
+    if (!updated.email) return
 
-    const { from, user } = mailOptions
-    const sendfrom = `"${seo.title || 'Mx Space'}" <${from || user}>`
-    await this.emailService.getInstance().sendMail({
-      from: sendfrom,
-      to: doc.email,
-      subject: `嘿!~, 主人已处理你的友链申请!~`,
-      text: `申请结果：${LinkStateMap[state]}\n原因：${reason}`,
-    })
+    await this.sendLinkMail(
+      updated.email,
+      `Hey! Your friend link application has been processed`,
+      `Result: ${LinkStateMap[state]}\nReason: ${reason}`,
+    )
+  }
+
+  async migrateExternalAvatarsForPassedLinks() {
+    return this.linkAvatarService.migratePassedLinks()
   }
 }

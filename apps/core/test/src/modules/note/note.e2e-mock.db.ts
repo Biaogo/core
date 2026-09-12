@@ -1,4 +1,4 @@
-import type { NoteModel } from '~/modules/note/note.model'
+import type { NoteModel } from '~/modules/note/note.types'
 
 export default Array.from({ length: 20 }).map((_, _i) => {
   const i = _i + 1
@@ -9,7 +9,7 @@ export default Array.from({ length: 20 }).map((_, _i) => {
     modified: null,
     allowComment: true,
 
-    hide: false,
+    isPublished: true,
     commentsIndex: 0,
   }
 }) as NoteModel[]

@@ -1,30 +1,29 @@
 import type { ModuleMetadata } from '@nestjs/common'
 import type { NestFastifyApplication } from '@nestjs/platform-fastify'
-
-import { ValidationPipe } from '@nestjs/common'
 import { Test, TestingModule } from '@nestjs/testing'
+import { AuthTestingGuard } from 'test/mock/guard/auth.guard'
 
 import { fastifyApp } from '~/common/adapters/fastify.adapter'
+import { AuthGuard } from '~/common/guards/auth.guard'
+import { requestCaseNormalizationPipeInstance } from '~/common/pipes/case-normalization.pipe'
+import { standardSchemaValidationPipeInstance } from '~/common/zod'
 
 export const setupE2EApp = async (module: TestingModule | ModuleMetadata) => {
   let nextModule: TestingModule
   if (module instanceof TestingModule) {
     nextModule = module
   } else {
-    nextModule = await Test.createTestingModule(module).compile()
+    nextModule = await Test.createTestingModule(module)
+      .overrideGuard(AuthGuard)
+      .useClass(AuthTestingGuard)
+      .compile()
   }
 
   const app =
     nextModule.createNestApplication<NestFastifyApplication>(fastifyApp)
   app.useGlobalPipes(
-    new ValidationPipe({
-      transform: true,
-      whitelist: true,
-      errorHttpStatusCode: 422,
-      forbidUnknownValues: true,
-      enableDebugMessages: isDev,
-      stopAtFirstError: true,
-    }),
+    requestCaseNormalizationPipeInstance,
+    standardSchemaValidationPipeInstance,
   )
 
   await app.init()

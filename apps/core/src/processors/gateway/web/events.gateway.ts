@@ -1,61 +1,77 @@
-import { debounce, uniqBy } from 'lodash'
-import SocketIO from 'socket.io'
+import type { IncomingMessage } from 'node:http'
+
+import type { WsEnvelope } from '@mx-space/ws-client/protocol'
+import { Logger } from '@nestjs/common'
 import type {
-  GatewayMetadata,
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets'
-import type { BroadcastOperator, Emitter } from '@socket.io/redis-emitter'
-import type {
-  DecorateAcknowledgementsWithMultipleResponses,
-  DefaultEventsMap,
-} from 'socket.io/dist/typed-events'
-import type { SocketType } from '../gateway.service'
-import type { EventGatewayHooks } from './hook.interface'
-
 import {
   ConnectedSocket,
   MessageBody,
   SubscribeMessage,
   WebSocketGateway,
-  WebSocketServer,
 } from '@nestjs/websockets'
+import { debounce, uniqBy } from 'es-toolkit/compat'
+import type { WebSocket } from 'ws'
 
 import { BusinessEvents } from '~/constants/business-event.constant'
 import { RedisKeys } from '~/constants/cache.constant'
+import { AuthService } from '~/modules/auth/auth.service'
 import { RedisService } from '~/processors/redis/redis.service'
 import { getRedisKey } from '~/utils/redis.util'
 import { scheduleManager } from '~/utils/schedule.util'
 import { getShortDate } from '~/utils/time.util'
 
-import { BroadcastBaseGateway } from '../base.gateway'
+import type { SocketLike } from '../gateway.service'
 import { GatewayService } from '../gateway.service'
-import { MessageEventDto, SupportedMessageEvent } from './dtos/message'
+import type { WsConnection } from '../ws/ws.types'
+import { WsBusService } from '../ws/ws-bus.service'
+import { buildAck } from '../ws/ws-envelope'
+import {
+  LANG_PATTERN,
+  langUpdatePayloadSchema,
+  roomPayloadSchema,
+  sessionUpdatePayloadSchema,
+  WsInboundEvents,
+} from '../ws/ws-events'
+import { WsGatewayBase } from '../ws/ws-gateway.base'
+import { WsPresenceService } from '../ws/ws-presence.service'
+import type { EventGatewayHooks } from './hook.interface'
 
 declare module '~/types/socket-meta' {
   interface SocketMetadata {
     sessionId: string
+    lang?: string
+    readerId?: string
+    connectedAt?: number
 
     roomJoinedAtMap: Record<string, number>
   }
 }
 
-const namespace = 'web'
+const langRoom = (lang: string) => `lang:${lang}`
 
-// @UseGuards(WsExtendThrottlerGuard)
-@WebSocketGateway<GatewayMetadata>({
-  namespace,
-})
+// ws defaults maxPayload to 100 MiB; cap at the ~1 MiB the socket.io
+// transport enforced so unauthenticated clients cannot buffer-bomb the node.
+@WebSocketGateway({ path: '/ws/web', maxPayload: 1024 * 1024 })
 export class WebEventsGateway
-  extends BroadcastBaseGateway
+  extends WsGatewayBase
   implements OnGatewayConnection, OnGatewayDisconnect
 {
+  private readonly logger = new Logger(WebEventsGateway.name)
+
   constructor(
     private readonly redisService: RedisService,
 
     private readonly gatewayService: GatewayService,
+
+    private readonly authService: AuthService,
+
+    bus: WsBusService,
+    presence: WsPresenceService,
   ) {
-    super()
+    super('web', bus, presence)
   }
 
   private hooks: EventGatewayHooks = {
@@ -79,9 +95,6 @@ export class WebEventsGateway
     }
   }
 
-  @WebSocketServer()
-  private namespace: SocketIO.Namespace
-
   async sendOnlineNumber() {
     return {
       online: await this.getCurrentClientCount(),
@@ -90,95 +103,208 @@ export class WebEventsGateway
   }
 
   async getCurrentClientCount() {
-    const server = this.namespace.server
+    const ids = await this.presence.connectionIds('web')
+    if (ids.length === 0) return 0
 
-    const socketsMeta = await Promise.all(
-      await server
-        .of(`/${namespace}`)
-        .fetchSockets()
-        .then((sockets) => {
-          return sockets.map((socket) =>
-            this.gatewayService.getSocketMetadata(socket),
-          )
-        }),
-    )
-    // // 这里用 web socket id 作为同一用户，一般 web 用 userId 或者 local storage sessionId 作为 socket session id
-    // return uniqBy(socketsMeta, async (x) => {
-    //   const meta = await this.gatewayService.getSocketMetadata(x)
-    //   console.log(meta, 'meta', x.id, 'x.id')
-    //   return meta?.sessionId || true
-    // }).length
-    return uniqBy(socketsMeta, (x) => x?.sessionId).length
+    const metas = await this.gatewayService.getSocketMetadataMany(ids)
+    return uniqBy(metas, (x) => x?.sessionId).length
   }
 
-  @SubscribeMessage('message')
-  async handleMessageEvent(
-    @MessageBody() data: MessageEventDto,
-    @ConnectedSocket() socket: SocketIO.Socket,
-  ) {
-    const { payload, type } = data
+  async handleConnection(ws: WebSocket, request: IncomingMessage) {
+    const conn = this.trackConnection(ws)
+    const query = parseQuery(request)
 
-    // logger.debug('Received message', { type, payload })
+    const sessionId = query.get('socket_session_id') || conn.id
+    const rawLang = query.get('lang')
+    const lang = rawLang && LANG_PATTERN.test(rawLang) ? rawLang : undefined
 
-    switch (type) {
-      case SupportedMessageEvent.Join: {
-        const { roomName } = payload as { roomName: string }
-        if (roomName) {
-          socket.join(roomName)
-          this.hooks.onJoinRoom.forEach((fn) => fn(socket, roomName))
-
-          const roomJoinedAtMap = await this.getSocketRoomJoinedAtMap(socket)
-
-          roomJoinedAtMap[roomName] = Date.now()
-
-          await this.gatewayService.setSocketMetadata(socket, {
-            roomJoinedAtMap,
-          })
-        }
-        break
-      }
-      case SupportedMessageEvent.Leave: {
-        const { roomName } = payload as { roomName: string }
-        if (roomName) {
-          socket.leave(roomName)
-          this.hooks.onLeaveRoom.forEach((fn) => fn(socket, roomName))
-
-          const roomJoinedAtMap = await this.getSocketRoomJoinedAtMap(socket)
-          delete roomJoinedAtMap[roomName]
-          await this.gatewayService.setSocketMetadata(socket, {
-            roomJoinedAtMap,
-          })
-        }
-        break
-      }
-      case SupportedMessageEvent.UpdateSid: {
-        const { sessionId } = payload as { sessionId: string }
-        if (sessionId) {
-          await this.gatewayService.setSocketMetadata(socket, { sessionId })
-          this.whenUserOnline()
-        }
-      }
-    }
-
-    this.hooks.onMessage.forEach((fn) => fn(socket, data))
-  }
-
-  async handleConnection(socket: SocketIO.Socket) {
-    const webSessionId =
-      socket.handshake.headers['x-socket-session-id'] ||
-      socket.handshake.query.socket_session_id ||
-      // fallback sid
-      socket.id
-
-    // logger.debug('webSessionId', webSessionId)
-
-    await this.gatewayService.setSocketMetadata(socket, {
-      sessionId: webSessionId,
+    await this.presence.addConnection('web', conn.id)
+    await this.gatewayService.setSocketMetadata(conn, {
+      sessionId,
+      connectedAt: Date.now(),
+      ...(lang ? { lang } : {}),
     })
 
+    if (lang) {
+      this.roomManager.join(langRoom(lang), conn)
+      await this.presence.joinRoom('web', langRoom(lang), conn.id)
+    }
+
+    const readerId = await this.resolveReaderId(request)
+
+    // A close anywhere above already ran the disconnect cleanup, which cannot
+    // see writes this handler issues afterwards. Undo them or they outlive the
+    // socket forever: presence GC only reclaims ids owned by dead nodes.
+    if (!this.resolveConnection(ws)) {
+      await this.releaseConnection(conn)
+      await this.gatewayService.clearSocketMetadata(conn)
+      return
+    }
+
+    if (readerId) {
+      await this.gatewayService.setSocketMetadata(conn, { readerId })
+    }
+
     this.whenUserOnline()
-    super.handleConnect(socket)
-    this.hooks.onConnected.forEach((fn) => fn(socket))
+    this.sendConnectGreeting(conn)
+    this.hooks.onConnected.forEach((fn) => fn(conn))
+
+    this.sendOnlineNumber()
+      .then((data) => {
+        this.sendTo(conn, BusinessEvents.VISITOR_ONLINE, data)
+      })
+      .catch(() => {})
+  }
+
+  async handleDisconnect(ws: WebSocket) {
+    const conn = this.resolveConnection(ws)
+    if (!conn) return
+
+    const meta = await this.gatewayService.getSocketMetadata(conn)
+    const leftRooms = await this.releaseConnection(conn)
+
+    this.sendDisconnectGreeting(conn)
+    this.broadcast(BusinessEvents.VISITOR_OFFLINE, {
+      ...(await this.sendOnlineNumber()),
+      sessionId: meta?.sessionId,
+    })
+
+    this.hooks.onDisconnected.forEach((fn) => fn(conn))
+    leftRooms.forEach((room) => {
+      this.hooks.onLeaveRoom.forEach((fn) => fn(conn, room))
+    })
+
+    this.gatewayService.clearSocketMetadata(conn)
+  }
+
+  @SubscribeMessage(WsInboundEvents.ping)
+  handlePing(@MessageBody() envelope: WsEnvelope) {
+    return envelope.id ? buildAck(envelope.id, { ok: true }) : undefined
+  }
+
+  @SubscribeMessage(WsInboundEvents.roomJoin)
+  async handleRoomJoin(
+    @MessageBody() envelope: WsEnvelope,
+    @ConnectedSocket() ws: WebSocket,
+  ) {
+    const conn = this.resolveConnection(ws)
+    const parsed = roomPayloadSchema.safeParse(envelope.payload)
+    if (!conn || !parsed.success) {
+      return ack(envelope, { ok: false, code: 'ROOM_INVALID' })
+    }
+
+    const room = parsed.data.room
+    this.roomManager.join(room, conn)
+    await this.presence.joinRoom('web', room, conn.id)
+    this.logger.log(`Connection ${conn.id} joined room [${room}]`)
+    this.hooks.onJoinRoom.forEach((fn) => fn(conn, room))
+
+    const roomJoinedAtMap = await this.getSocketRoomJoinedAtMap(conn)
+    roomJoinedAtMap[room] = Date.now()
+    await this.gatewayService.setSocketMetadata(conn, { roomJoinedAtMap })
+
+    this.notifyMessageHooks(conn, envelope)
+    return ack(envelope, { ok: true })
+  }
+
+  @SubscribeMessage(WsInboundEvents.roomLeave)
+  async handleRoomLeave(
+    @MessageBody() envelope: WsEnvelope,
+    @ConnectedSocket() ws: WebSocket,
+  ) {
+    const conn = this.resolveConnection(ws)
+    const parsed = roomPayloadSchema.safeParse(envelope.payload)
+    if (!conn || !parsed.success) {
+      return ack(envelope, { ok: false, code: 'ROOM_INVALID' })
+    }
+
+    const room = parsed.data.room
+    this.roomManager.leave(room, conn)
+    await this.presence.leaveRoom('web', room, conn.id)
+    this.hooks.onLeaveRoom.forEach((fn) => fn(conn, room))
+
+    const roomJoinedAtMap = await this.getSocketRoomJoinedAtMap(conn)
+    delete roomJoinedAtMap[room]
+    await this.gatewayService.setSocketMetadata(conn, { roomJoinedAtMap })
+
+    this.notifyMessageHooks(conn, envelope)
+    return ack(envelope, { ok: true })
+  }
+
+  @SubscribeMessage(WsInboundEvents.sessionUpdate)
+  async handleSessionUpdate(
+    @MessageBody() envelope: WsEnvelope,
+    @ConnectedSocket() ws: WebSocket,
+  ) {
+    const conn = this.resolveConnection(ws)
+    const parsed = sessionUpdatePayloadSchema.safeParse(envelope.payload)
+    if (!conn || !parsed.success) {
+      return ack(envelope, { ok: false, code: 'VALIDATION_FAILED' })
+    }
+
+    await this.gatewayService.setSocketMetadata(conn, {
+      sessionId: parsed.data.sessionId,
+    })
+    this.whenUserOnline()
+
+    this.notifyMessageHooks(conn, envelope)
+    return ack(envelope, { ok: true })
+  }
+
+  @SubscribeMessage(WsInboundEvents.langUpdate)
+  async handleLangUpdate(
+    @MessageBody() envelope: WsEnvelope,
+    @ConnectedSocket() ws: WebSocket,
+  ) {
+    const conn = this.resolveConnection(ws)
+    const parsed = langUpdatePayloadSchema.safeParse(envelope.payload)
+    if (!conn || !parsed.success) {
+      return ack(envelope, { ok: false, code: 'VALIDATION_FAILED' })
+    }
+
+    await this.updateConnectionLang(conn, parsed.data.lang)
+
+    this.notifyMessageHooks(conn, envelope)
+    return ack(envelope, { ok: true })
+  }
+
+  private notifyMessageHooks(conn: WsConnection, envelope: WsEnvelope) {
+    this.hooks.onMessage.forEach((fn) => fn(conn, envelope))
+  }
+
+  private async resolveReaderId(
+    request: IncomingMessage,
+  ): Promise<string | undefined> {
+    const cookie = request.headers.cookie
+    if (!cookie) return undefined
+    const { origin } = request.headers
+    try {
+      const headers = new Headers()
+      headers.set('cookie', cookie)
+      if (origin) headers.set('origin', origin)
+      const session = await this.authService.getSessionUserFromHeaders(headers)
+      const id = session?.user?.id
+      return typeof id === 'string' ? id : undefined
+    } catch (error) {
+      this.logger.debug(
+        `resolveReaderId failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+      return undefined
+    }
+  }
+
+  private async updateConnectionLang(conn: WsConnection, lang: string) {
+    const meta = await this.gatewayService.getSocketMetadata(conn)
+    const prevLang = meta?.lang
+    if (prevLang) {
+      this.roomManager.leave(langRoom(prevLang), conn)
+      await this.presence.leaveRoom('web', langRoom(prevLang), conn.id)
+    }
+    this.roomManager.join(langRoom(lang), conn)
+    await this.presence.joinRoom('web', langRoom(lang), conn.id)
+    await this.gatewayService.setSocketMetadata(conn, { lang })
   }
 
   whenUserOnline = debounce(
@@ -215,83 +341,42 @@ export class WebEventsGateway
     },
   )
 
-  async handleDisconnect(socket: SocketIO.Socket) {
-    super.handleDisconnect(socket)
-    this.broadcast(BusinessEvents.VISITOR_OFFLINE, {
-      ...(await this.sendOnlineNumber()),
-      sessionId: (await this.gatewayService.getSocketMetadata(socket))
-        ?.sessionId,
+  public async getSocketsOfRoom(roomName: string): Promise<SocketLike[]> {
+    const ids = await this.presence.roomMemberIds('web', roomName)
+    return ids.map((id) => ({ id }))
+  }
+
+  public async getAllRooms(): Promise<Record<string, SocketLike[]>> {
+    const sizes = await this.presence.roomSizes('web')
+    const rooms = Object.keys(sizes)
+    const members = await Promise.all(
+      rooms.map((room) => this.presence.roomMemberIds('web', room)),
+    )
+
+    const roomToSocketsMap: Record<string, SocketLike[]> = {}
+    rooms.forEach((room, index) => {
+      roomToSocketsMap[room] = members[index].map((id) => ({ id }))
     })
-    this.hooks.onDisconnected.forEach((fn) => fn(socket))
-    this.gatewayService.clearSocketMetadata(socket)
-
-    socket.rooms.forEach((roomName) => {
-      this.hooks.onLeaveRoom.forEach((fn) => fn(socket, roomName))
-    })
-  }
-
-  override broadcast(
-    event: BusinessEvents,
-    data: any,
-
-    options?: {
-      rooms?: string[]
-      exclude?: string[]
-    },
-  ) {
-    const emitter = this.redisService.emitter
-
-    let socket = emitter.of(`/${namespace}`) as
-      | Emitter<DefaultEventsMap>
-      | BroadcastOperator<DefaultEventsMap>
-    const rooms = options?.rooms
-    const exclude = options?.exclude
-
-    if (rooms && rooms.length > 0) {
-      socket = socket.in(rooms)
-    }
-    if (exclude && exclude.length > 0) {
-      socket = socket.except(exclude)
-    }
-    socket.emit('message', this.gatewayMessageFormat(event, data))
-  }
-
-  public getSocketsOfRoom(
-    roomName: string,
-  ): Promise<
-    | SocketIO.Socket[]
-    | SocketIO.RemoteSocket<
-        DecorateAcknowledgementsWithMultipleResponses<DefaultEventsMap>,
-        any
-      >[]
-  > {
-    return this.namespace.in(roomName).fetchSockets()
-  }
-
-  // private isValidBizRoomName(roomName: string) {
-  //   return roomName.split('-').length === 2
-  // }
-  public async getAllRooms() {
-    const sockets = await this.namespace.fetchSockets()
-    const roomToSocketsMap = {} as Record<string, (typeof sockets)[number][]>
-    for (const socket of sockets) {
-      socket.rooms.forEach((roomName) => {
-        if (roomName === socket.id) return
-
-        if (!roomToSocketsMap[roomName]) {
-          roomToSocketsMap[roomName] = []
-        }
-        roomToSocketsMap[roomName].push(socket)
-      })
-    }
     return roomToSocketsMap
   }
 
-  public async getSocketRoomJoinedAtMap(socket: SocketType) {
+  public async getSocketRoomJoinedAtMap(socket: SocketLike) {
     const roomJoinedAtMap =
       (await this.gatewayService.getSocketMetadata(socket))?.roomJoinedAtMap ||
       {}
 
     return roomJoinedAtMap
+  }
+}
+
+function ack(envelope: WsEnvelope, payload: { ok: boolean; code?: string }) {
+  return envelope.id ? buildAck(envelope.id, payload) : undefined
+}
+
+function parseQuery(request: IncomingMessage): URLSearchParams {
+  try {
+    return new URL(request.url ?? '', 'ws://localhost').searchParams
+  } catch {
+    return new URLSearchParams()
   }
 }

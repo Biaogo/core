@@ -3,13 +3,13 @@ import type { IController } from '~/interfaces/controller'
 import type { IRequestHandler, RequestProxyResult } from '~/interfaces/request'
 import type { PaginateResult } from '~/models/base'
 import type { NoteModel } from '~/models/note'
+import type { PageModel } from '~/models/page'
 import type { PostModel } from '~/models/post'
-import type { PageModel } from '..'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
 
-declare module '../core/client' {
+import type { HTTPClient } from '../core'
+
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -18,13 +18,65 @@ declare module '../core/client' {
   }
 }
 
-export type SearchType = 'post' | 'note'
+export type SearchType = 'post' | 'note' | 'page'
 
 export type SearchOption = {
   orderBy?: string
   order?: number
-  rawAlgolia?: boolean
+  /** Override the request-context lang for this query. Server falls back to
+   * the request `x-lang` header / `?lang=` if not set. */
+  lang?: string
 }
+
+export type SearchHighlight = {
+  keywords: string[]
+  snippet: string | null
+}
+
+export type SearchResultMeta = {
+  /** The lang of the index row that produced this hit. */
+  lang: string
+  /** True when the hit came from the source-language fallback rather than the
+   * effective lang index. UI can flag these as "matched in original". */
+  isFallback: boolean
+}
+
+type SearchResultHighlight = {
+  highlight: SearchHighlight
+} & SearchResultMeta
+
+export type SearchRebuildStats = {
+  total: number
+  created: number
+  updated: number
+  deleted: number
+  skipped: number
+}
+
+export type SearchAdminListQuery = {
+  refType?: SearchType
+  lang?: string
+  keyword?: string
+  page?: number
+  size?: number
+}
+
+export type SearchAdminDocument = {
+  id: string
+  refType: SearchType
+  refId: string
+  lang: string
+  sourceHash: string
+  title: string
+  titleLength: number
+  bodyLength: number
+  isPublished: boolean
+  publicAt: string | null
+  hasPassword: boolean
+  modifiedAt: string | null
+  createdAt: string
+}
+
 export class SearchController<ResponseWrapper> implements IController {
   base = 'search'
   name = 'search'
@@ -40,11 +92,12 @@ export class SearchController<ResponseWrapper> implements IController {
   search(
     type: 'note',
     keyword: string,
-    options?: Omit<SearchOption, 'rawAlgolia'>,
+    options?: SearchOption,
   ): Promise<
     RequestProxyResult<
       PaginateResult<
-        Pick<NoteModel, 'modified' | 'id' | 'title' | 'created' | 'nid'>
+        Pick<NoteModel, 'modifiedAt' | 'id' | 'title' | 'createdAt' | 'nid'> &
+          SearchResultHighlight
       >,
       ResponseWrapper
     >
@@ -52,58 +105,84 @@ export class SearchController<ResponseWrapper> implements IController {
   search(
     type: 'post',
     keyword: string,
-    options?: Omit<SearchOption, 'rawAlgolia'>,
+    options?: SearchOption,
   ): Promise<
     RequestProxyResult<
       PaginateResult<
         Pick<
           PostModel,
-          'modified' | 'id' | 'title' | 'created' | 'slug' | 'category'
-        >
+          'modifiedAt' | 'id' | 'title' | 'createdAt' | 'slug' | 'category'
+        > &
+          SearchResultHighlight
       >,
       ResponseWrapper
     >
   >
   search(
-    type: SearchType,
+    type: 'page',
     keyword: string,
-    options: Omit<SearchOption, 'rawAlgolia'> = {},
-  ): any {
+    options?: SearchOption,
+  ): Promise<
+    RequestProxyResult<
+      PaginateResult<
+        Pick<PageModel, 'modifiedAt' | 'id' | 'title' | 'createdAt' | 'slug'> &
+          SearchResultHighlight
+      >,
+      ResponseWrapper
+    >
+  >
+  search(type: SearchType, keyword: string, options: SearchOption = {}): any {
     return this.proxy(type).get({
       params: { keyword, ...options },
     })
   }
-  /**
-   * 从 algolya 搜索
-   * https://www.algolia.com/doc/api-reference/api-methods/search/
-   * @param keyword
-   * @param options
-   * @returns
-   */
-  searchByAlgolia(keyword: string, options?: SearchOption) {
-    return this.proxy('algolia').get<
+
+  searchAll(keyword: string, options?: SearchOption) {
+    return this.proxy.get<
       RequestProxyResult<
         PaginateResult<
           | (Pick<
               PostModel,
-              'modified' | 'id' | 'title' | 'created' | 'slug' | 'category'
-            > & { type: 'post' })
+              'modifiedAt' | 'id' | 'title' | 'createdAt' | 'slug' | 'category'
+            > &
+              SearchResultHighlight & { type: 'post' })
           | (Pick<
               NoteModel,
-              'id' | 'created' | 'id' | 'modified' | 'title' | 'nid'
-            > & { type: 'note' })
+              'id' | 'createdAt' | 'modifiedAt' | 'title' | 'nid'
+            > &
+              SearchResultHighlight & { type: 'note' })
           | (Pick<
               PageModel,
-              'id' | 'title' | 'created' | 'modified' | 'slug'
-            > & { type: 'page' })
-        > & {
-          /**
-           * @see: algoliasearch <https://www.algolia.com/doc/api-reference/api-methods/search/>
-           */
-          raw?: any
-        },
+              'id' | 'title' | 'createdAt' | 'modifiedAt' | 'slug'
+            > &
+              SearchResultHighlight & { type: 'page' })
+        >,
         ResponseWrapper
       >
     >({ params: { keyword, ...options } })
+  }
+
+  /** Trigger a global rebuild. Defaults to incremental (sourceHash diff);
+   * pass `force: true` for the legacy delete-all + bulk-upsert path. */
+  rebuild(opts: { force?: boolean } = {}) {
+    return this.proxy.rebuild.post<
+      RequestProxyResult<SearchRebuildStats, ResponseWrapper>
+    >({
+      params: opts.force ? { force: true } : undefined,
+    })
+  }
+
+  /** Force-refresh a single article and all of its translations. */
+  rebuildOne(refType: SearchType, refId: string) {
+    return this.proxy
+      .rebuild(refType)(refId)
+      .post<RequestProxyResult<{ rebuilt: number }, ResponseWrapper>>()
+  }
+
+  /** Admin-facing paginated listing of indexed documents (verification UI). */
+  adminListDocuments(query: SearchAdminListQuery = {}) {
+    return this.proxy.admin.documents.get<
+      RequestProxyResult<PaginateResult<SearchAdminDocument>, ResponseWrapper>
+    >({ params: query as Record<string, any> })
   }
 }

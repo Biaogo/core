@@ -9,19 +9,27 @@
   ],
   "packageRules": [
     {
-      "updateTypes": ["major"],
-      "labels": ["UPDATE-MAJOR"]
+      "updateTypes": [
+        "major"
+      ],
+      "labels": [
+        "UPDATE-MAJOR"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "@earendil-works/pi-ai"
+      ],
+      "labels": [
+        "requires-faux-and-live-tests"
+      ],
+      "rangeStrategy": "pin"
     }
   ],
   "ignoreDeps": [
-    "class-validator",
-    "class-transformer",
     "vitest",
     "vite",
-    "snakecase-keys",
-    "zx",
-    "algoliasearch",
-    "@algolia/client-search"
+    "snakecase-keys"
   ],
   "enabled": true
 }

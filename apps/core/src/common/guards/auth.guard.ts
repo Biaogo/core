@@ -1,79 +1,48 @@
-import { isJWT } from 'class-validator'
 import type { CanActivate, ExecutionContext } from '@nestjs/common'
-import type { UserModel } from '~/modules/user/user.model'
-import type { FastifyBizRequest } from '~/transformers/get-req.transformer'
+import { Injectable } from '@nestjs/common'
 
-import { Injectable, UnauthorizedException } from '@nestjs/common'
-
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { AuthService } from '~/modules/auth/auth.service'
-import { ConfigsService } from '~/modules/configs/configs.service'
-import { UserService } from '~/modules/user/user.service'
+import type { SessionUser } from '~/modules/auth/auth.types'
+import type { FastifyBizRequest } from '~/transformers/get-req.transformer'
 import { getNestExecutionContextRequest } from '~/transformers/get-req.transformer'
-
-/**
- * JWT auth guard
- */
 
 @Injectable()
 export class AuthGuard implements CanActivate {
-  constructor(
-    protected readonly authService: AuthService,
-    protected readonly configs: ConfigsService,
+  constructor(protected readonly authService: AuthService) {}
 
-    protected readonly userService: UserService,
-  ) {}
-  async canActivate(context: ExecutionContext): Promise<any> {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = this.getRequest(context)
-
-    const query = request.query as any
-    const headers = request.headers
 
     const session = await this.authService.getSessionUser(request.raw)
 
-    const Authorization: string =
-      headers.authorization || headers.Authorization || query.token
-
-    if (session) {
-      const isOwner = !!session.user?.isOwner
-
-      if (isOwner) {
-        this.attachUserAndToken(
-          request,
-          await this.userService.getMaster(),
-          Authorization,
-        )
-        return true
-      }
-    }
-
-    if (!Authorization) {
-      throw new UnauthorizedException('未登录')
-    }
-
-    if (this.authService.isCustomToken(Authorization)) {
-      const [isValid, userModel] =
-        await this.authService.verifyCustomToken(Authorization)
-      if (!isValid) {
-        throw new UnauthorizedException('令牌无效')
-      }
-
-      this.attachUserAndToken(request, userModel, Authorization)
+    if (session?.user?.role === 'owner') {
+      this.attachUserAndToken(
+        request,
+        session.user as SessionUser,
+        session.session?.token || '',
+      )
       return true
     }
 
-    const jwt = Authorization.replace(/[Bb]earer /, '')
+    const apiKey = this.authService.getApiKeyFromRequest({
+      headers: request.headers,
+    })
 
-    if (!isJWT(jwt)) {
-      throw new UnauthorizedException('令牌无效')
+    if (!apiKey) {
+      throw createAppException(AppErrorCode.AUTH_NOT_LOGGED_IN)
     }
-    const valid = await this.authService.jwtServicePublic.verify(jwt)
 
-    if (!valid) throw new UnauthorizedException('身份过期')
-    this.attachUserAndToken(
-      request,
-      await this.userService.getMaster(),
-      Authorization,
-    )
+    const result = await this.authService.verifyApiKey(apiKey.key)
+    if (!result?.referenceId) {
+      throw createAppException(AppErrorCode.AUTH_TOKEN_INVALID)
+    }
+
+    const readerUser = await this.authService.getReaderById(result.referenceId)
+    if (!readerUser || readerUser.role !== 'owner') {
+      throw createAppException(AppErrorCode.AUTH_TOKEN_INVALID)
+    }
+    this.attachUserAndToken(request, readerUser, apiKey.key)
     return true
   }
 
@@ -83,15 +52,12 @@ export class AuthGuard implements CanActivate {
 
   attachUserAndToken(
     request: FastifyBizRequest,
-    user: UserModel,
+    user: SessionUser,
     token: string,
   ) {
     request.user = user
     request.token = token
 
-    Object.assign(request.raw, {
-      user,
-      token,
-    })
+    Object.assign(request.raw, { user, token })
   }
 }

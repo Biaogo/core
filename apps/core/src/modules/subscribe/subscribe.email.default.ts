@@ -1,10 +1,9 @@
-import type { UserModel, UserModelSecurityKeys } from '../user/user.model'
-
+import type { OwnerModel, OwnerModelSecurityKeys } from '../owner/owner.types'
 import { SubscribeAllBit } from './subscribe.constant'
 
 const defaultPostProps = {
-  text: '年纪在四十以上，二十以下的，恐怕就不易在前两派里有个地位了。他们的车破，又不敢“拉晚儿”，所以只能早早的出车，希望能从清晨转到午后三四点钟，拉出“车份儿”和自己的嚼谷①。他们的车破，跑得慢，所以得多走路，少要钱。到瓜市，果市，菜市，去拉货物，都是他们；钱少，可是无须快跑呢。',
-  title: '骆驼祥子',
+  text: 'It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity, it was the season of light, it was the season of darkness, it was the spring of hope, it was the winter of despair.',
+  title: 'A Tale of Two Cities',
 }
 
 export const defaultSubscribeForRenderProps = {
@@ -13,10 +12,10 @@ export const defaultSubscribeForRenderProps = {
   author: '',
   detail_link: '#detail_link',
   unsubscribe_link: '#unsubscribe_link',
-  master: '',
+  owner: '',
 
   aggregate: {
-    owner: {} as Omit<UserModel, UserModelSecurityKeys>,
+    owner: {} as Omit<OwnerModel, OwnerModelSecurityKeys>,
     subscriber: {
       email: 'subscriber@mail.com',
       subscribe: SubscribeAllBit,

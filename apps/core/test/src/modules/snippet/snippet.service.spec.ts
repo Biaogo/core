@@ -1,142 +1,138 @@
-import { stringify } from 'qs'
-import { redisHelper } from 'test/helper/redis-mock.helper'
+import { describe, expect, it, vi } from 'vitest'
 
-import { createRedisProvider } from '@/mock/modules/redis.mock'
-import { nanoid } from '@mx-space/compiled'
-import { BadRequestException, NotFoundException } from '@nestjs/common'
-import { Test } from '@nestjs/testing'
-import { getModelForClass } from '@typegoose/typegoose'
-
-import { ServerlessService } from '~/modules/serverless/serverless.service'
-import { SnippetModel, SnippetType } from '~/modules/snippet/snippet.model'
+import { createPgRepositoryMock, now } from '@/helper/pg-repository-mock'
+import { AppException } from '~/common/errors/exception.types'
+import type { SnippetRepository } from '~/modules/snippet/snippet.repository'
+import { SnippetType } from '~/modules/snippet/snippet.schema'
 import { SnippetService } from '~/modules/snippet/snippet.service'
-import { DatabaseService } from '~/processors/database/database.service'
-import { EventManagerService } from '~/processors/helper/helper.event.service'
-import { CacheService } from '~/processors/redis/cache.service'
-import { getModelToken } from '~/transformers/model.transformer'
+import type { SnippetRow } from '~/modules/snippet/snippet.types'
 
-const mockedEventManageService = { async emit() {} }
-describe('test Snippet Service', async () => {
-  let service: SnippetService
+const createSnippet = (overrides: Partial<SnippetRow> = {}): SnippetRow => ({
+  id: '1' as any,
+  type: SnippetType.JSON,
+  private: false,
+  raw: '{"enabled":true}',
+  path: 'root/feature-flags.json',
+  comment: null,
+  metatype: null,
+  schema: null,
+  method: null,
+  secret: null,
+  enable: true,
+  builtIn: false,
+  compiledCode: null,
+  createdAt: now,
+  updatedAt: null,
+  ...overrides,
+})
 
-  beforeAll(async () => {
-    const redis = await redisHelper
-    const moduleRef = Test.createTestingModule({
-      providers: [
-        SnippetService,
-        await createRedisProvider(),
-        { provide: DatabaseService, useValue: {} },
-        { provide: CacheService, useValue: redis.CacheService },
-        {
-          provide: ServerlessService,
-          useValue: {
-            isValidServerlessFunction() {
-              return true
-            },
-          },
-        },
-        { provide: EventManagerService, useValue: mockedEventManageService },
+const createService = () => {
+  const repository = createPgRepositoryMock<SnippetRepository>()
+  const serverlessService = {
+    isValidServerlessFunction: vi.fn().mockResolvedValue(true),
+    compileTypescriptCode: vi.fn(async (code: string) => `compiled:${code}`),
+  }
+  const redis = {
+    hset: vi.fn(),
+    hget: vi.fn(),
+    hdel: vi.fn(),
+  }
+  const redisService = {
+    getClient: vi.fn(() => redis),
+  }
+  const eventManager = {
+    emit: vi.fn(),
+  }
+  const configsService = {
+    get: vi.fn().mockResolvedValue({ serverUrl: '' }),
+  }
 
-        {
-          provide: getModelToken(SnippetModel.name),
-          useValue: getModelForClass(SnippetModel),
-        },
-      ],
-    })
+  const service = new SnippetService(
+    repository as any,
+    serverlessService as any,
+    redisService as any,
+    eventManager as any,
+    configsService as any,
+  )
 
-    const app = await moduleRef.compile()
-    await app.init()
-    service = app.get(SnippetService)
-  })
+  return { redis, repository, serverlessService, service }
+}
 
-  const snippet = {
-    name: 'test',
-    raw: '{"foo": "bar"}',
-    type: SnippetType.JSON,
-    private: false,
-    reference: 'root',
-  } as SnippetModel
+describe('SnippetService', () => {
+  it('creates JSON snippets through the PG repository with path defaults', async () => {
+    const { repository, service } = createService()
+    const created = createSnippet()
+    repository.countByPathMethod.mockResolvedValue(0)
+    repository.create.mockResolvedValue(created)
 
-  let id = ''
-  it('should create one', async () => {
-    const res = await service.create(snippet)
+    await expect(
+      service.create({
+        raw: '{"enabled":true}',
+        path: 'root/feature-flags.json',
+      }),
+    ).resolves.toEqual(created)
 
-    expect(res).toMatchObject(snippet)
-    expect(res.id).toBeDefined()
-
-    id = res.id
-  })
-
-  it('should not allow duplicate create', async () => {
-    await expect(service.create(snippet)).rejects.toThrow(BadRequestException)
-  })
-
-  test('get snippet by name', async () => {
-    const res = await service.getSnippetByName(snippet.name, snippet.reference)
-    expect(res.name).toBe(snippet.name)
-  })
-
-  test('get snippet by name again from cache', async () => {
-    const res = await service.getSnippetByName(snippet.name, snippet.reference)
-    expect(res.name).toBe(snippet.name)
-  })
-
-  test('get full snippet', async () => {
-    const res = await service.getSnippetById(id)
-    expect(res.name).toBe(snippet.name)
-  })
-
-  test('modify', async () => {
-    const newSnippet = {
-      ...snippet,
-      raw: '{"foo": "b"}',
-    } as SnippetModel
-    const res = await service.update(id, newSnippet)
-    expect(res.raw).toBe(newSnippet.raw)
-  })
-
-  test('get snippet by name after update', async () => {
-    const res = await service.getSnippetByName(snippet.name, snippet.reference)
-    expect(res.raw).toBe('{"foo": "b"}')
-  })
-
-  test('delete', async () => {
-    await service.delete(id)
-    await expect(service.getSnippetById(id)).rejects.toThrow(NotFoundException)
-  })
-
-  describe('update function snippet with secret', () => {
-    const createTestingModel = () =>
-      ({
-        name: `test-fn-${nanoid.nanoid()}`,
-        raw: 'export default async function handler() {}',
-        type: SnippetType.Function,
+    expect(repository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SnippetType.JSON,
         private: false,
-        reference: 'root',
-        id: nanoid.nanoid(),
-        secret: 'username=123&password=123',
-      }) as SnippetModel
+        path: 'root/feature-flags.json',
+        raw: '{"enabled":true}',
+        secret: null,
+      }),
+    )
+  })
 
-    test('patch secret', async () => {
-      const newSnippet = createTestingModel()
-      const doc = await service.create(newSnippet)
+  it('rejects duplicate path/method pairs before writing', async () => {
+    const { repository, service } = createService()
+    repository.countByPathMethod.mockResolvedValue(1)
 
-      await service.update(doc.id, {
-        ...newSnippet,
-        secret: stringify({ username: '', password: '' }),
-      })
-      const afterUpdate = await service.getSnippetById(doc.id)
+    await expect(
+      service.create({
+        raw: '{}',
+        path: 'root/feature-flags.json',
+      }),
+    ).rejects.toThrow(AppException)
 
-      expect(afterUpdate.secret).toStrictEqual({
-        username: '',
-        password: '',
-      })
+    expect(repository.create).not.toHaveBeenCalled()
+  })
 
-      const raw = await service.model.findById(doc.id).select('+secret').lean({
-        getters: true,
-      })
+  it('compiles function snippets and defaults method to GET', async () => {
+    const { repository, serverlessService, service } = createService()
+    repository.countByPathMethod.mockResolvedValue(0)
+    repository.create.mockResolvedValue(
+      createSnippet({
+        type: SnippetType.Function,
+        path: 'fn/handler',
+        raw: 'export default async function handler() {}',
+        compiledCode: 'compiled:export default async function handler() {}',
+      }),
+    )
 
-      expect(raw.secret).toBe(newSnippet.secret)
+    await service.create({
+      type: SnippetType.Function,
+      raw: 'export default async function handler() {}',
+      path: 'fn/handler',
     })
+
+    expect(serverlessService.compileTypescriptCode).toHaveBeenCalled()
+    expect(repository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'GET',
+        enable: true,
+        compiledCode: 'compiled:export default async function handler() {}',
+      }),
+    )
+  })
+
+  it('invalidates public and private path cache keys when deleting a snippet', async () => {
+    const { redis, repository, service } = createService()
+    repository.findById.mockResolvedValue(createSnippet())
+    repository.deleteById.mockResolvedValue(createSnippet())
+
+    await service.delete('1')
+
+    expect(repository.deleteById).toHaveBeenCalledWith('1')
+    expect(redis.hdel).toHaveBeenCalledTimes(2)
   })
 })

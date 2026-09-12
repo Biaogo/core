@@ -1,53 +1,47 @@
-/**
- * Logging interceptor.
- * @file 日志拦截器
- * @module interceptor/logging
- * @author Surmon <https://github.com/surmon-china>
- * @author Innei <https://github.com/Innei>
- */
-import { tap } from 'rxjs/operators'
 import type {
   CallHandler,
   ExecutionContext,
   NestInterceptor,
 } from '@nestjs/common'
-import type { Observable } from 'rxjs'
-
 import { Injectable, Logger, SetMetadata } from '@nestjs/common'
+import pc from 'picocolors'
+import { Observable } from 'rxjs'
+import { tap } from 'rxjs/operators'
 
 import { HTTP_REQUEST_TIME } from '~/constants/meta.constant'
-import { getNestExecutionContextRequest } from '~/transformers/get-req.transformer'
+import {
+  getNestExecutionContextRequest,
+  isHttpExecutionContext,
+} from '~/transformers/get-req.transformer'
 
 @Injectable()
 export class LoggingInterceptor implements NestInterceptor {
-  private logger: Logger
-  constructor() {
-    this.logger = new Logger(LoggingInterceptor.name, { timestamp: false })
-  }
+  private readonly logger = new Logger(LoggingInterceptor.name, {
+    timestamp: false,
+  })
+
   intercept(
     context: ExecutionContext,
     next: CallHandler<any>,
   ): Observable<any> {
-    const call$ = next.handle()
+    if (!isHttpExecutionContext(context)) {
+      return next.handle()
+    }
 
-    const request = this.getRequest(context)
-
-    const content = `${request.method} -> ${request.url}`
-    this.logger.debug(`+++ 收到请求：${content}`)
+    const request = getNestExecutionContextRequest(context)
+    const content = `${request.method} ${request.url}`
+    this.logger.debug(`${pc.dim('→')} ${content}`)
     const now = Date.now()
 
-    SetMetadata(HTTP_REQUEST_TIME, now)(this.getRequest(context) as any)
+    SetMetadata(HTTP_REQUEST_TIME, now)(request as any)
 
-    return call$.pipe(
-      tap(() =>
+    return next.handle().pipe(
+      tap(() => {
+        const statusCode = context.switchToHttp().getResponse()?.statusCode
         this.logger.debug(
-          `--- 响应请求：${content}${chalk.yellow(` +${Date.now() - now}ms`)}`,
-        ),
-      ),
+          `${pc.dim('←')} ${content} ${pc.cyan(statusCode)} ${pc.yellow(`+${Date.now() - now}ms`)}`,
+        )
+      }),
     )
-  }
-
-  getRequest(context: ExecutionContext) {
-    return getNestExecutionContextRequest(context)
   }
 }

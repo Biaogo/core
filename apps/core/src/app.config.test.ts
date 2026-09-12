@@ -1,13 +1,9 @@
-import type { AxiosRequestConfig } from 'axios'
-
 export const PORT = process.env.PORT || 2333
-export const API_VERSION = 2
-
-export const DEMO_MODE = false
+export const API_VERSION = 3
 
 export const CROSS_DOMAIN = {
-  allowedOrigins: argv.allowed_origins
-    ? argv.allowed_origins?.split?.(',')
+  allowedOrigins: process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',')
     : [
         'innei.ren',
         '*.innei.ren',
@@ -23,19 +19,6 @@ export const CROSS_DOMAIN = {
   // allowedReferer: 'innei.ren',
 }
 
-export const MONGO_DB = {
-  dbName: 'mx-space',
-  host: '127.0.0.1',
-  port: 27017,
-  user: '',
-  password: argv.db_password || '',
-  get uri() {
-    const userPassword =
-      this.user && this.password ? `${this.user}:${this.password}@` : ''
-    return `mongodb://${userPassword}${this.host}:${this.port}/${'mx-space_unitest'}`
-  },
-}
-
 export const REDIS = {
   host: 'localhost',
   port: 6379,
@@ -46,18 +29,14 @@ export const REDIS = {
   disableApiCache: true,
 }
 
-export const AXIOS_CONFIG: AxiosRequestConfig = {
-  timeout: 10000,
-}
-
 export const SECURITY = {
-  jwtSecret: argv.jwt_secret || argv.jwtSecret,
-  jwtExpire: +argv.jwt_expire || 14,
+  jwtSecret: process.env.JWT_SECRET,
+  jwtExpire: Number(process.env.JWT_EXPIRE) || 14,
 }
 
 export const CLUSTER = {
-  enable: argv.cluster ?? false,
-  workers: argv.cluster_workers,
+  enable: process.env.CLUSTER === 'true',
+  workers: process.env.CLUSTER_WORKERS,
 }
 
 export const DEBUG_MODE = {
@@ -72,4 +51,21 @@ export const ENCRYPT = {
 export const THROTTLE_OPTIONS = {
   ttl: 10_000,
   limit: 50,
+}
+
+export const SNOWFLAKE = {
+  workerId: Number(process.env.SNOWFLAKE_WORKER_ID ?? 1),
+  // 2026-05-02T00:00:00.000Z
+  epochMs: 1746144000000,
+}
+
+export const POSTGRES = {
+  connectionString: process.env.PG_URL || process.env.PG_CONNECTION_STRING,
+  host: process.env.PG_HOST || '127.0.0.1',
+  port: Number(process.env.PG_PORT || 5432),
+  user: process.env.PG_USER || 'mx',
+  password: process.env.PG_PASSWORD || 'mx',
+  database: process.env.PG_DATABASE || 'mx_core_test',
+  maxPoolSize: Number(process.env.PG_MAX_POOL_SIZE || 5),
+  ssl: false as const,
 }

@@ -5,7 +5,6 @@ import { DependencyController } from './dependency.controller'
 
 @Module({
   controllers: [DependencyController],
-  providers: [],
   imports: [ServerlessModule],
 })
 export class DependencyModule {}

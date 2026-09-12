@@ -6,7 +6,6 @@ import { FeedController } from './feed.controller'
 
 @Module({
   controllers: [FeedController],
-  providers: [],
   imports: [AggregateModule, MarkdownModule],
 })
 export class FeedModule {}

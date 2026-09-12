@@ -2,13 +2,12 @@ import type { IRequestAdapter } from '~/interfaces/adapter'
 import type { IController } from '~/interfaces/controller'
 import type { IRequestHandler } from '~/interfaces/request'
 import type { SayModel } from '~/models/say'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
 
+import type { HTTPClient } from '../core'
 import { BaseCrudController } from './base'
 
-declare module '../core/client' {
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -37,6 +36,6 @@ export class SayController<ResponseWrapper>
    * 获取随机一条
    */
   getRandom() {
-    return this.proxy.random.get<{ data: SayModel | null }>()
+    return this.proxy.random.get<SayModel | null>()
   }
 }

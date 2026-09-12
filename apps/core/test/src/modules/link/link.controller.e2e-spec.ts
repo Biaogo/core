@@ -1,92 +1,58 @@
-import { createE2EApp } from 'test/helper/create-e2e-app'
-import { gatewayProviders } from 'test/mock/modules/gateway.mock'
-import { userProvider } from 'test/mock/modules/user.mock'
-import { emailProvider } from 'test/mock/processors/email.mock'
-import { eventEmitterProvider } from 'test/mock/processors/event.mock'
-import type { ReturnModelType } from '@typegoose/typegoose'
+import { describe, expect, it, vi } from 'vitest'
 
-import { createRedisProvider } from '@/mock/modules/redis.mock'
-
-import { ExtendedValidationPipe } from '~/common/pipes/validation.pipe'
-import { VALIDATION_PIPE_INJECTION } from '~/constants/system.constant'
-import { OptionModel } from '~/modules/configs/configs.model'
-import { ConfigsService } from '~/modules/configs/configs.service'
+import { AppException } from '~/common/errors/exception.types'
 import {
   LinkController,
   LinkControllerCrud,
 } from '~/modules/link/link.controller'
-import { LinkModel, LinkState } from '~/modules/link/link.model'
-import { LinkService } from '~/modules/link/link.service'
-import { HttpService } from '~/processors/helper/helper.http.service'
 
-describe('Test LinkController(E2E)', async () => {
-  const proxy = createE2EApp({
-    controllers: [LinkController, LinkControllerCrud],
-    models: [LinkModel, OptionModel],
-    providers: [
-      ...gatewayProviders,
-      LinkService,
+describe('LinkController', () => {
+  it('blocks link applications when the PG-backed service reports disabled audit', async () => {
+    const service = {
+      canApplyLink: vi.fn().mockResolvedValue(false),
+      applyForLink: vi.fn(),
+      sendToOwner: vi.fn(),
+    }
+    const controller = new LinkController(service as any)
 
-      emailProvider,
-      HttpService,
-
-      userProvider,
-      await createRedisProvider(),
-      ConfigsService,
-      ...eventEmitterProvider,
-      {
-        provide: VALIDATION_PIPE_INJECTION,
-        useValue: ExtendedValidationPipe.shared,
-      },
-    ],
-    async pourData(modelMap) {
-      const linkModel = modelMap.get(LinkModel)
-
-      ;(linkModel.model as ReturnModelType<typeof LinkModel>).create({
-        url: 'https://innei.in',
-        name: 'innei',
-        avatar: 'https://innei.in/avatar.png',
-        description: 'innei',
-        state: LinkState.Outdate,
-      })
-    },
+    await expect(
+      controller.applyForLink({
+        url: 'https://example.com',
+        name: 'Example',
+        author: 'Alice',
+      } as any),
+    ).rejects.toThrow(AppException)
+    expect(service.applyForLink).not.toHaveBeenCalled()
   })
 
-  it('should change state to audit', async () => {
-    const app = proxy.app
-    const res = await app.inject({
-      method: 'post',
-      url: '/links/audit',
-      payload: {
-        url: 'https://innei.in',
-        name: 'innnnn',
-        author: 'innei',
-        avatar: 'https://innei.in/avatar.png',
-        description: 'innei',
-      },
-    })
-    expect(res.statusCode).toBe(204)
-  })
+  it('returns approved links with converted avatar metadata', async () => {
+    const service = {
+      approveLink: vi.fn().mockResolvedValue({
+        link: { id: 'link-1', email: null },
+        convertedAvatar: 'https://cdn.example/avatar.png',
+      }),
+      sendToCandidate: vi.fn(),
+    }
+    const controller = new LinkController(service as any)
 
-  it('apply link repeat should throw', async () => {
-    const app = proxy.app
-    const res = await app.inject({
-      method: 'post',
-      url: '/links/audit',
-      payload: {
-        url: 'https://innei.in',
-        name: 'innnnn',
-        author: 'innei',
-        avatar: 'https://innei.in/avatar.png',
-        description: 'innei',
-      },
+    await expect(controller.approveLink('link-1')).resolves.toEqual({
+      link: { id: 'link-1', email: null },
+      convertedAvatar: 'https://cdn.example/avatar.png',
     })
-    expect(res.json()).toMatchInlineSnapshot(`
-          {
-            "error": "Bad Request",
-            "message": "请不要重复申请友链哦",
-            "statusCode": 400,
-          }
-        `)
+  })
+})
+
+describe('LinkControllerCrud', () => {
+  it('hides email fields for anonymous list responses', async () => {
+    const repository = {
+      list: vi.fn().mockResolvedValue({
+        data: [{ id: '1', email: 'owner@example.com' }],
+        pagination: { total: 1, currentPage: 1, totalPage: 1, size: 10 },
+      }),
+    }
+    const controller = new LinkControllerCrud(repository as any, {} as any)
+
+    const result = await controller.gets({ page: 1, size: 10 } as any, false)
+    expect(result.data).toEqual([{ id: '1', email: null }])
   })
 })

@@ -1,21 +1,14 @@
-import { instanceToPlain } from 'class-transformer'
+import { Body, Get, Param, Patch } from '@nestjs/common'
 
+import { AppErrorCode, createAppException } from '~/common/errors'
 import {
-  BadRequestException,
-  Body,
-  Get,
-  Param,
-  Patch,
-  UnprocessableEntityException,
-} from '@nestjs/common'
-
-import { BanInDemo } from '~/common/decorators/demo.decorator'
-import { HTTPDecorators } from '~/common/decorators/http.decorator'
+  attachAiProviderOptionsToFormDSL,
+  generateFormDSL,
+} from '~/modules/configs/configs.dsl.util'
+import { sanitizeConfigForResponse } from '~/modules/configs/configs.encrypt.util'
 import { IConfig } from '~/modules/configs/configs.interface'
 import { ConfigsService } from '~/modules/configs/configs.service'
-import { classToJsonSchema } from '~/utils/jsonschema.util'
 
-import { ConfigKeyDto } from '../dtoes/config.dto'
 import { OptionController } from '../option.decorator'
 
 @OptionController()
@@ -24,37 +17,40 @@ export class BaseOptionController {
 
   @Get('/')
   getOption() {
-    return instanceToPlain(this.configsService.getConfig())
+    return this.configsService.getConfigForResponse()
   }
 
-  @HTTPDecorators.Bypass
-  @Get('/jsonschema')
-  getJsonSchema() {
-    return Object.assign(classToJsonSchema(IConfig), {
-      default: this.configsService.defaultConfig,
-    })
+  @Get('/form-schema')
+  async getFormSchema() {
+    const schema = generateFormDSL()
+    schema.defaults = this.configsService.defaultConfig
+
+    const aiConfig = await this.configsService.get('ai')
+    attachAiProviderOptionsToFormDSL(schema, aiConfig)
+
+    return schema
   }
 
   @Get('/:key')
   async getOptionKey(@Param('key') key: keyof IConfig) {
-    if (typeof key !== 'string' && !key) {
-      throw new UnprocessableEntityException(
-        `key must be IConfigKeys, got ${key}`,
-      )
-    }
-    const value = await this.configsService.get(key)
+    const value = await this.configsService.getForResponse(key)
     if (!value) {
-      throw new BadRequestException('key is not exists.')
+      throw createAppException(AppErrorCode.CONFIG_NOT_FOUND, {
+        id: key as string,
+      })
     }
-    return { data: instanceToPlain(value) }
+    return value
   }
 
   @Patch('/:key')
-  @BanInDemo
-  patch(@Param() params: ConfigKeyDto, @Body() body: Record<string, any>) {
+  async patch(
+    @Param('key') key: keyof IConfig,
+    @Body() body: Record<string, any>,
+  ) {
     if (typeof body !== 'object') {
-      throw new UnprocessableEntityException('body must be object')
+      throw createAppException(AppErrorCode.INVALID_BODY)
     }
-    return this.configsService.patchAndValid(params.key, body)
+    const result = await this.configsService.patchAndValid(key, body)
+    return sanitizeConfigForResponse(result as object, key)
   }
 }

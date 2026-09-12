@@ -1,418 +1,597 @@
-import { isDefined } from 'class-validator'
-import { debounce, omit } from 'lodash'
-import slugify from 'slugify'
-import type { DocumentType } from '@typegoose/typegoose'
-import type { AggregatePaginateModel, Document, Types } from 'mongoose'
-
 import {
   BadRequestException,
-  forwardRef,
-  Inject,
   Injectable,
-  NotFoundException,
+  OnApplicationBootstrap,
 } from '@nestjs/common'
+import { ModuleRef } from '@nestjs/core'
+import { debounce, omit } from 'es-toolkit/compat'
+import slugify from 'slugify'
 
-import { BusinessException } from '~/common/exceptions/biz.exception'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { ArticleTypeEnum } from '~/constants/article.constant'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { CollectionRefTypes } from '~/constants/db.constant'
-import { ErrorCodeEnum } from '~/constants/error-code.constant'
 import { EventBusEvents } from '~/constants/event-bus.constant'
+import {
+  CATEGORY_SERVICE_TOKEN,
+  DRAFT_SERVICE_TOKEN,
+} from '~/constants/injection.constant'
+import type { MarkdownToLexicalMigrationDescriptor } from '~/modules/content-migration/content-migration.schema'
+import { ContentMigrationCommitService } from '~/modules/content-migration/content-migration-commit.service'
+import { FileReferenceType } from '~/modules/file/file-reference.enum'
+import { FileReferenceService } from '~/modules/file/file-reference.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
 import { ImageService } from '~/processors/helper/helper.image.service'
-import { TextMacroService } from '~/processors/helper/helper.macro.service'
-import { InjectModel } from '~/transformers/model.transformer'
+import { LexicalService } from '~/processors/helper/helper.lexical.service'
+import { ContentFormat } from '~/shared/types/content-format.type'
+import { contentIdentityChanged, isLexical } from '~/utils/content.util'
 import { scheduleManager } from '~/utils/schedule.util'
 import { getLessThanNow } from '~/utils/time.util'
 
-import { getArticleIdFromRoomName } from '../activity/activity.util'
-import { CategoryService } from '../category/category.service'
-import { CommentModel } from '../comment/comment.model'
+import type { CategoryService } from '../category/category.service'
+import { CommentService } from '../comment/comment.service'
+import { DraftRefType } from '../draft/draft.enum'
+import type { DraftService } from '../draft/draft.service'
+import { EnrichmentService } from '../enrichment/enrichment.service'
 import { SlugTrackerService } from '../slug-tracker/slug-tracker.service'
-import { PostModel } from './post.model'
+import { PostRepository } from './post.repository'
+import {
+  POST_PROTECTED_KEYS,
+  type PostListParams,
+  type PostModel,
+} from './post.types'
 
 @Injectable()
-export class PostService {
+export class PostService implements OnApplicationBootstrap {
+  private categoryService: CategoryService
+  private draftService: DraftService
+
   constructor(
-    @InjectModel(PostModel)
-    private readonly postModel: MongooseModel<PostModel> &
-      AggregatePaginateModel<PostModel & Document>,
-    @InjectModel(CommentModel)
-    private readonly commentModel: MongooseModel<CommentModel>,
-
-    @Inject(forwardRef(() => CategoryService))
-    private categoryService: CategoryService,
+    private readonly postRepository: PostRepository,
+    private readonly commentService: CommentService,
     private readonly imageService: ImageService,
+    private readonly fileReferenceService: FileReferenceService,
     private readonly eventManager: EventManagerService,
-    private readonly textMacroService: TextMacroService,
-
     private readonly slugTrackerService: SlugTrackerService,
+    private readonly lexicalService: LexicalService,
+    private readonly contentMigrationCommitService: ContentMigrationCommitService,
+    private readonly enrichmentService: EnrichmentService,
+    private readonly moduleRef: ModuleRef,
   ) {}
 
-  get model() {
-    return this.postModel
+  onApplicationBootstrap() {
+    this.categoryService = this.moduleRef.get(CATEGORY_SERVICE_TOKEN, {
+      strict: false,
+    })
+    this.draftService = this.moduleRef.get(DRAFT_SERVICE_TOKEN, {
+      strict: false,
+    })
+  }
+
+  public get repository() {
+    return this.postRepository
+  }
+
+  async list(params: PostListParams = {}) {
+    return this.postRepository.list(params)
+  }
+
+  async listPaginated(params: PostListParams = {}) {
+    return this.postRepository.list(params)
+  }
+
+  async findById(id: string) {
+    return this.postRepository.findById(id)
+  }
+
+  async findBySlug(slug: string) {
+    return this.postRepository.findBySlug(slug)
+  }
+
+  async findByCategoryAndSlug(
+    categoryId: string,
+    slug: string,
+    isAuthenticated?: boolean,
+  ) {
+    return this.postRepository.findByCategoryAndSlug(categoryId, slug, {
+      publishedOnly: !isAuthenticated,
+    })
+  }
+
+  async findRecent(
+    size: number,
+    options: { publishedOnly?: boolean; metaOnly?: boolean } = {},
+  ) {
+    return this.postRepository.findRecent(size, options)
+  }
+
+  async findManyByIds(ids: string[]) {
+    return this.postRepository.findManyByIds(ids)
+  }
+
+  async count() {
+    return this.postRepository.count()
+  }
+
+  async countByCategoryId(
+    categoryId: string,
+    options: { publishedOnly?: boolean } = {},
+  ) {
+    return this.postRepository.countByCategoryId(categoryId, options)
+  }
+
+  async listByCategory(
+    categoryId: string,
+    options: {
+      includeCategory?: boolean
+      limit?: number
+      publishedOnly?: boolean
+      metaOnly?: boolean
+    } = {},
+  ) {
+    return this.postRepository.listByCategory(categoryId, options)
+  }
+
+  async listByCategoryIds(
+    categoryIds: ReadonlyArray<string>,
+    options: {
+      includeCategory?: boolean
+      publishedOnly?: boolean
+      metaOnly?: boolean
+    } = {},
+  ) {
+    return this.postRepository.listByCategoryIds(categoryIds, options)
+  }
+
+  async findByCategoryId(categoryId: string) {
+    return this.listByCategory(categoryId)
+  }
+
+  async findByTag(
+    tag: string,
+    options: {
+      includeCategory?: boolean
+      metaOnly?: boolean
+      publishedOnly?: boolean
+    } = {},
+  ) {
+    return this.postRepository.findByTag(tag, options)
+  }
+
+  async aggregateAllTagCounts(options: { publishedOnly?: boolean } = {}) {
+    return this.postRepository.aggregateAllTagCounts(options)
+  }
+
+  async aggregateTagCountsByCategory(
+    categoryId: string,
+    options: { publishedOnly?: boolean } = {},
+  ) {
+    return this.postRepository.aggregateTagCountsByCategory(categoryId, options)
+  }
+
+  async findAdjacent(
+    direction: 'before' | 'after',
+    pivotDate: Date,
+    options: { publishedOnly?: boolean } = {},
+  ) {
+    return this.postRepository.findAdjacent(direction, pivotDate, options)
   }
 
   async create(post: PostModel) {
-    const { categoryId } = post
+    this.lexicalService.normalizeContentForStorage(post)
 
+    const effectiveContentFormat = post.contentFormat ?? ContentFormat.Markdown
+    if (post.isPremium && effectiveContentFormat !== ContentFormat.Lexical) {
+      throw createAppException(AppErrorCode.PREMIUM_REQUIRES_LEXICAL)
+    }
+
+    const { categoryId } = post
     const category = await this.categoryService.findCategoryById(
       categoryId as any as string,
     )
     if (!category) {
-      throw new BadRequestException('分类丢失了 ಠ_ಠ')
+      throw createAppException(AppErrorCode.CATEGORY_NOT_FOUND)
     }
 
     const slug = post.slug ? slugify(post.slug) : slugify(post.title)
     if (!(await this.isAvailableSlug(slug))) {
-      throw new BusinessException(ErrorCodeEnum.SlugNotAvailable)
+      throw createAppException(AppErrorCode.SLUG_NOT_AVAILABLE)
     }
 
-    // 有关联文章
-
     const relatedIds = await this.checkRelated(post)
-    post.related = relatedIds as any
-
-    const newPost = await this.postModel.create({
-      ...post,
+    const createdAt = getLessThanNow(post.createdAt ?? (post as any).created)
+    const pinAt = post.pinAt ?? (post as any).pin ?? null
+    let doc = await this.postRepository.create({
+      title: post.title,
       slug,
+      createdAt,
+      text: post.text,
+      content: post.content,
+      contentFormat: post.contentFormat ?? ContentFormat.Markdown,
+      summary: post.summary,
+      images: post.images as unknown[],
+      meta: post.meta,
+      tags: post.tags,
       categoryId: category.id,
-      created: getLessThanNow(post.created),
-      modified: null,
+      copyright: post.copyright,
+      isPublished: post.isPublished,
+      isPremium: post.isPremium,
+      pinAt,
+      pinOrder: post.pinOrder,
     })
+    if (createdAt && createdAt.valueOf() !== doc.createdAt.valueOf()) {
+      const refreshed = await this.postRepository.update(doc.id, {
+        modifiedAt: null,
+      })
+      if (refreshed) doc = refreshed
+    }
 
-    const doc = newPost.toJSON()
-    const cloned = { ...doc }
-
-    // 双向关联
     await this.relatedEachOther(doc, relatedIds)
 
     scheduleManager.schedule(async () => {
-      const doc = cloned
       await Promise.all([
-        this.imageService.saveImageDimensionsFromMarkdownText(
-          doc.text,
-          doc.images,
-          (images) => {
-            newPost.images = images
-            return newPost.save()
-          },
+        this.fileReferenceService.activateReferences(
+          doc,
+          doc.id,
+          FileReferenceType.Post,
         ),
+        !isLexical(doc) &&
+          this.imageService.saveImageDimensionsFromMarkdownText(
+            doc.text,
+            doc.images,
+            async (images) => {
+              await this.postRepository.setImages(doc.id, images)
+            },
+          ),
         this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
           scope: EventScope.TO_SYSTEM,
         }),
-        this.eventManager.broadcast(
+        this.eventManager.emit(
           BusinessEvents.POST_CREATE,
+          { id: doc.id },
           {
-            ...doc,
-            category,
-          },
-          {
-            scope: EventScope.TO_SYSTEM,
-          },
-        ),
-        this.eventManager.broadcast(
-          BusinessEvents.POST_CREATE,
-          {
-            ...doc,
-            category,
-            text: await this.textMacroService.replaceTextMacro(doc.text, doc),
-          },
-          {
-            scope: EventScope.TO_VISITOR,
+            scope: doc.isPublished
+              ? EventScope.TO_SYSTEM_VISITOR
+              : EventScope.TO_SYSTEM,
           },
         ),
       ])
     })
 
+    this.enrichmentService.scheduleDocPrefetch(doc)
+
     return doc
   }
 
   private async trackSlugChanges(
-    oldDocument: PostModel,
+    oldDocument: any,
     newDocument: Partial<PostModel>,
   ) {
-    const createTracker = this.slugTrackerService.createTracker.bind(
-      this.slugTrackerService,
-    )
-
     const oldDocumentRefCategory = await this.categoryService.findCategoryById(
       oldDocument.categoryId.toString(),
     )
     if (!oldDocumentRefCategory) {
-      throw new BadRequestException('分类丢失了 ಠ_ಠ')
+      throw createAppException(AppErrorCode.CATEGORY_NOT_FOUND)
     }
     const oldSlugMeta = {
       slug: oldDocument.slug,
       categorySlug: oldDocumentRefCategory.slug,
     }
 
-    if (newDocument.slug && oldSlugMeta.slug !== newDocument.slug) {
-      return trackSlugChanges()
-    }
-    if (
-      newDocument.categoryId &&
-      oldDocument.categoryId !== newDocument.categoryId
-    ) {
-      return trackSlugChanges()
-    }
-
-    function trackSlugChanges() {
-      return createTracker(
+    const createSlugChangeTracker = () =>
+      this.slugTrackerService.createTracker(
         `/${oldSlugMeta.categorySlug}/${oldSlugMeta.slug}`,
         ArticleTypeEnum.Post,
         oldDocument.id,
       )
+
+    if (newDocument.slug && oldSlugMeta.slug !== newDocument.slug) {
+      return createSlugChangeTracker()
+    }
+    if (
+      newDocument.categoryId &&
+      String(oldDocument.categoryId) !== String(newDocument.categoryId)
+    ) {
+      return createSlugChangeTracker()
     }
   }
 
-  async getPostBySlug(categorySlug: string, slug: string) {
-    const slugTrackerService = this.slugTrackerService
-    const postModel = this.postModel
+  async getPostBySlug(
+    categorySlug: string,
+    slug: string,
+    isAuthenticated?: boolean,
+  ) {
+    const findTrackedPost = async () => {
+      const tracked = await this.slugTrackerService.findTrackerBySlug(
+        `/${categorySlug}/${slug}`,
+        ArticleTypeEnum.Post,
+      )
+      return tracked ? this.findById(tracked.targetId) : null
+    }
 
     const categoryDocument = await this.getCategoryBySlug(categorySlug)
     if (!categoryDocument) {
       const trackedPost = await findTrackedPost()
-      if (!trackedPost) {
-        throw new NotFoundException('该分类未找到 (｡•́︿•̀｡)')
+      if (!trackedPost)
+        throw createAppException(AppErrorCode.CATEGORY_NOT_FOUND)
+      if (!isAuthenticated && !trackedPost.isPublished) {
+        throw createAppException(AppErrorCode.POST_NOT_FOUND, {
+          id: trackedPost.id,
+        })
       }
       return trackedPost
     }
 
-    const postDocument = await this.model
-      .findOne({
-        slug,
-        categoryId: categoryDocument._id,
-      })
-      .populate('category')
-      .populate({
-        path: 'related',
-        select: 'title slug id _id categoryId category',
-      })
-
+    const postDocument = await this.findByCategoryAndSlug(
+      categoryDocument.id,
+      slug,
+      isAuthenticated,
+    )
     if (postDocument) return postDocument
 
-    return findTrackedPost()
-    async function findTrackedPost() {
-      const tracked = await slugTrackerService.findTrackerBySlug(
-        `/${categorySlug}/${slug}`,
-        ArticleTypeEnum.Post,
-      )
-
-      if (tracked) {
-        return postModel
-          .findById(tracked.targetId)
-          .populate('category')
-          .populate({
-            path: 'related',
-            select: 'title slug id _id categoryId category',
-          })
-      }
+    const trackedPost = await findTrackedPost()
+    if (trackedPost && !isAuthenticated && !trackedPost.isPublished) {
+      throw createAppException(AppErrorCode.POST_NOT_FOUND, {
+        id: trackedPost.id,
+      })
     }
+    return trackedPost
   }
 
-  async updateById(id: string, data: Partial<PostModel>) {
-    const oldDocument = await this.postModel.findById(id)
+  async updateById(
+    id: string,
+    data: Partial<PostModel> & {
+      migration?: MarkdownToLexicalMigrationDescriptor
+      migrationBranchId?: string
+    },
+  ) {
+    this.lexicalService.normalizeContentForStorage(data)
+
+    const oldDocument = await this.findById(id)
     if (!oldDocument) {
-      throw new BadRequestException('文章不存在')
+      throw createAppException(AppErrorCode.POST_NOT_FOUND, { id })
     }
-    // 看看 category 改了没
+
+    const { migration, migrationBranchId } = data
+    const isMarkdownToLexical =
+      oldDocument.contentFormat === ContentFormat.Markdown &&
+      data.contentFormat === ContentFormat.Lexical
+    const effectiveIsPremium =
+      data.isPremium !== undefined ? data.isPremium : oldDocument.isPremium
+    const effectiveContentFormat =
+      data.contentFormat !== undefined
+        ? data.contentFormat
+        : oldDocument.contentFormat
+    if (
+      effectiveIsPremium &&
+      effectiveContentFormat !== ContentFormat.Lexical
+    ) {
+      throw createAppException(AppErrorCode.PREMIUM_REQUIRES_LEXICAL)
+    }
+    if (
+      oldDocument.contentFormat === ContentFormat.Lexical &&
+      data.contentFormat === ContentFormat.Markdown
+    ) {
+      throw new BadRequestException(
+        'Published Lexical content cannot be downgraded to Markdown',
+      )
+    }
+    if (isMarkdownToLexical && !migration) {
+      throw new BadRequestException(
+        'Markdown-to-Lexical writes require a migration descriptor',
+      )
+    }
+    if (migration && !isMarkdownToLexical) {
+      throw new BadRequestException(
+        'Migration descriptor is only valid for Markdown-to-Lexical writes',
+      )
+    }
+
     const { categoryId } = data
-    if (categoryId && categoryId !== oldDocument.categoryId) {
+    if (categoryId && String(categoryId) !== String(oldDocument.categoryId)) {
       const category = await this.categoryService.findCategoryById(
         categoryId as any as string,
       )
-      if (!category) {
-        throw new BadRequestException('分类不存在')
-      }
+      if (!category) throw createAppException(AppErrorCode.CATEGORY_NOT_FOUND)
     }
-    // 只有修改了 text title slug 的值才触发更新 modified 的时间
-    if ([data.text, data.title, data.slug].some((i) => isDefined(i))) {
-      const now = new Date()
 
-      data.modified = now
+    if (contentIdentityChanged(oldDocument, data)) {
+      data.modifiedAt = new Date()
     }
 
     if (data.slug && data.slug !== oldDocument.slug) {
       data.slug = slugify(data.slug)
-      const isAvailableSlug = await this.isAvailableSlug(data.slug)
-
-      if (!isAvailableSlug) {
-        throw new BusinessException(ErrorCodeEnum.SlugNotAvailable)
+      if (!(await this.isAvailableSlug(data.slug))) {
+        throw createAppException(AppErrorCode.SLUG_NOT_AVAILABLE)
       }
     }
 
     await this.trackSlugChanges(oldDocument, data)
 
-    // 有关联文章
     const related = await this.checkRelated(data)
     if (related.length > 0) {
-      data.related = related.filter((id) => id !== oldDocument.id) as any
-
-      // 双向关联
-      await this.relatedEachOther(oldDocument, related)
+      await this.relatedEachOther(
+        oldDocument,
+        related.filter((rel) => rel !== id),
+      )
     } else {
       await this.removeRelatedEachOther(oldDocument)
-      oldDocument.related = []
     }
 
-    Object.assign(
-      oldDocument,
-      omit(data, PostModel.protectedKeys),
-      data.created
-        ? {
-            created: getLessThanNow(data.created),
-          }
-        : {},
-    )
+    const patch = omit(data, POST_PROTECTED_KEYS as any) as Partial<PostModel>
+    const createdAt = (data as any).created
+      ? getLessThanNow((data as any).created)
+      : patch.createdAt
+    const pinAt =
+      (data as any).pin !== undefined ? (data as any).pin : patch.pinAt
+    const repositoryPatch = {
+      title: patch.title,
+      slug: patch.slug,
+      createdAt,
+      text: patch.text,
+      content: patch.content,
+      contentFormat: patch.contentFormat,
+      summary: patch.summary,
+      images: patch.images as unknown[] | undefined,
+      meta: patch.meta,
+      tags: patch.tags,
+      categoryId: patch.categoryId as string | undefined,
+      copyright: patch.copyright,
+      isPublished: patch.isPublished,
+      isPremium: patch.isPremium,
+      pinAt,
+      pinOrder: patch.pinOrder,
+      modifiedAt: data.modifiedAt,
+    }
 
-    await oldDocument.save()
-    scheduleManager.schedule(() => this.afterUpdatePost(id, data, oldDocument))
+    let updated
+    if (migration) {
+      if (!data.content || data.text === undefined) {
+        throw new BadRequestException(
+          'Lexical migration requires content and text',
+        )
+      }
+      await this.contentMigrationCommitService.commitMarkdownToLexical({
+        refType: DraftRefType.Post,
+        refId: id,
+        descriptor: migration,
+        branchId: migrationBranchId,
+        patch: repositoryPatch,
+        source: {
+          title: repositoryPatch.title ?? oldDocument.title,
+          text: data.text,
+          content: data.content,
+          contentFormat: ContentFormat.Lexical,
+          summary:
+            repositoryPatch.summary === undefined
+              ? oldDocument.summary
+              : repositoryPatch.summary,
+          tags:
+            repositoryPatch.tags === undefined
+              ? oldDocument.tags
+              : repositoryPatch.tags,
+          meta:
+            repositoryPatch.meta === undefined
+              ? oldDocument.meta
+              : repositoryPatch.meta,
+        },
+      })
+      updated = await this.postRepository.findById(id)
+    } else {
+      updated = await this.postRepository.update(id, repositoryPatch)
+    }
 
-    return oldDocument.toObject()
+    const wasPublished = oldDocument.isPublished
+    scheduleManager.schedule(() => this.afterUpdatePost(id, wasPublished))
+    if (updated) this.enrichmentService.scheduleDocPrefetch(updated)
+    return updated
   }
 
   afterUpdatePost = debounce(
-    async (
-      id: string,
-      updatedData: Partial<PostModel>,
-      oldDocument: DocumentType<PostModel>,
-    ) => {
-      const doc = await this.postModel
-        .findById(id)
-        .populate('related', 'title slug category categoryId id _id')
-        .lean({ getters: true, autopopulate: true })
-      // 更新图片信息缓存
+    async (id: string, wasPublished: boolean) => {
+      const doc = await this.findById(id)
+      if (doc) {
+        await this.fileReferenceService.updateReferencesForDocument(
+          doc,
+          doc.id,
+          FileReferenceType.Post,
+        )
+      }
+
       await Promise.all([
         this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
           scope: EventScope.TO_SYSTEM,
         }),
-        updatedData.text &&
+        doc?.text &&
+          !isLexical(doc) &&
           this.imageService.saveImageDimensionsFromMarkdownText(
-            updatedData.text,
-            doc?.images,
-            (images) => {
-              oldDocument.images = images
-              return oldDocument.save()
+            doc.text,
+            doc.images,
+            async (images) => {
+              await this.postRepository.setImages(id, images)
             },
           ),
         doc &&
-          this.eventManager.broadcast(
-            BusinessEvents.POST_UPDATE,
+          this.eventManager.emit(
+            wasPublished === doc.isPublished
+              ? BusinessEvents.POST_UPDATE
+              : doc.isPublished
+                ? BusinessEvents.POST_REPUBLISH
+                : BusinessEvents.POST_UNPUBLISH,
+            { id: doc.id },
             {
-              ...doc,
-              text: await this.textMacroService.replaceTextMacro(doc.text, doc),
-            },
-            {
-              scope: EventScope.TO_VISITOR,
-              // gateway: {
-              //   rooms: [getArticleIdFromRoomName(doc.id)],
-              // },
+              scope:
+                wasPublished || doc.isPublished
+                  ? EventScope.TO_SYSTEM_VISITOR
+                  : EventScope.TO_SYSTEM,
             },
           ),
-        doc &&
-          this.eventManager.broadcast(BusinessEvents.POST_UPDATE, doc, {
-            scope: EventScope.TO_SYSTEM,
-          }),
       ])
     },
     1000,
-    {
-      leading: false,
-    },
+    { leading: false },
   )
 
   async deletePost(id: string) {
-    const deletedPost = await this.postModel.findById(id).lean()
+    const deletedPost = await this.findById(id)
     await Promise.all([
-      this.model.deleteOne({ _id: id }),
-      this.commentModel.deleteMany({
-        ref: id,
-        refType: CollectionRefTypes.Post,
-      }),
+      this.postRepository.deleteById(id),
+      this.commentService.deleteForRef(CollectionRefTypes.Post, id),
+      this.draftService.deleteByRef(DraftRefType.Post, id),
       this.removeRelatedEachOther(deletedPost),
       this.slugTrackerService.deleteAllTracker(id),
+      this.fileReferenceService.removeReferencesForDocument(
+        id,
+        FileReferenceType.Post,
+      ),
     ])
-    await this.eventManager.broadcast(BusinessEvents.POST_DELETE, id, {
-      scope: EventScope.TO_SYSTEM_VISITOR,
-      nextTick: true,
-      gateway: {
-        rooms: [getArticleIdFromRoomName(id)],
-      },
-    })
+    await Promise.all([
+      this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
+        scope: EventScope.TO_SYSTEM,
+      }),
+      this.eventManager.emit(
+        BusinessEvents.POST_DELETE,
+        { id },
+        {
+          scope: EventScope.TO_SYSTEM_VISITOR,
+          nextTick: true,
+        },
+      ),
+    ])
   }
 
   async getCategoryBySlug(slug: string) {
-    return await this.categoryService.model.findOne({ slug })
+    return this.categoryService.findBySlug(slug)
   }
 
   async isAvailableSlug(slug: string) {
-    return (
-      slug.length > 0 && (await this.postModel.countDocuments({ slug })) === 0
-    )
+    return slug.length > 0 && !(await this.postRepository.findBySlug(slug))
   }
 
   async checkRelated<
     T extends Partial<Pick<PostModel, 'id' | 'related' | 'relatedId'>>,
   >(data: T): Promise<string[]> {
-    const cloned = { ...data }
+    if (!data.relatedId || data.relatedId.length === 0) return []
 
-    // 有关联文章
-    if (cloned.relatedId && cloned.relatedId.length > 0) {
-      const relatedPosts = await this.postModel.find({
-        _id: { $in: cloned.relatedId },
-      })
-      if (relatedPosts.length !== cloned.relatedId.length) {
-        throw new BadRequestException('关联文章不存在')
-      } else {
-        return relatedPosts.map((i) => {
-          if (i.related && (i.related as string[]).includes(data.id!)) {
-            throw new BadRequestException('文章不能关联自己')
-          }
-          return i.id
-        })
+    const relatedPosts = await this.postRepository.findManyByIds(data.relatedId)
+    if (relatedPosts.length !== data.relatedId.length) {
+      throw createAppException(AppErrorCode.POST_RELATED_NOT_EXISTS)
+    }
+
+    return relatedPosts.map((post) => {
+      if (post.id === data.id) {
+        throw createAppException(AppErrorCode.POST_SELF_RELATION)
       }
-    }
-    return []
-  }
-
-  async relatedEachOther(post: PostModel, relatedIds: string[]) {
-    if (relatedIds.length === 0) return
-    const relatedPosts = await this.postModel.find({
-      _id: { $in: relatedIds },
+      return post.id
     })
-
-    const postId = post.id
-    await Promise.all(
-      relatedPosts.map((i) => {
-        i.related ||= []
-
-        const set = new Set(i.related.map((i) => i.toString()) as string[])
-        set.add(postId.toString())
-        ;(i.related as string[]) = Array.from(set)
-
-        return i.save()
-      }),
-    )
   }
 
-  async removeRelatedEachOther(post: PostModel | null) {
+  async relatedEachOther(post: any, relatedIds: string[]) {
+    await this.postRepository.setRelatedPosts(post.id, relatedIds)
+  }
+
+  async removeRelatedEachOther(post: any | null) {
     if (!post) return
-    const postRelatedIds = (post.related as string[]) || []
-    if (postRelatedIds.length === 0) {
-      return
-    }
-    const relatedPosts = await this.postModel.find({
-      _id: { $in: postRelatedIds },
-    })
-    const postId = post.id
-    await Promise.all(
-      relatedPosts.map((i) => {
-        i.related = (i.related as any as Types.ObjectId[]).filter(
-          (id) => id && id.toHexString() !== postId,
-        ) as any
-        return i.save()
-      }),
-    )
+    await this.postRepository.setRelatedPosts(post.id, [])
   }
 }

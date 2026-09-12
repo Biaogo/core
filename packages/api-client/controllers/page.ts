@@ -1,14 +1,13 @@
 import type { IRequestAdapter } from '~/interfaces/adapter'
 import type { IController } from '~/interfaces/controller'
 import type { IRequestHandler } from '~/interfaces/request'
-import type { SelectFields } from '~/interfaces/types'
 import type { PaginateResult } from '~/models/base'
 import type { PageModel } from '~/models/page'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
 
-declare module '../core/client' {
+import type { HTTPClient } from '../core'
+
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -18,8 +17,7 @@ declare module '../core/client' {
 }
 
 export type PageListOptions = {
-  select?: SelectFields<keyof PageModel>
-  sortBy?: 'order' | 'subtitle' | 'title' | 'created' | 'modified'
+  sortBy?: 'order' | 'subtitle' | 'title' | 'createdAt' | 'modifiedAt'
   sortOrder?: 1 | -1
 }
 
@@ -36,12 +34,11 @@ export class PageController<ResponseWrapper> implements IController {
    * 页面列表
    */
   getList(page = 1, perPage = 10, options: PageListOptions = {}) {
-    const { select, sortBy, sortOrder } = options
+    const { sortBy, sortOrder } = options
     return this.proxy.get<PaginateResult<PageModel>>({
       params: {
         page,
         size: perPage,
-        select: select?.join(' '),
         sortBy,
         sortOrder,
       },
@@ -59,7 +56,9 @@ export class PageController<ResponseWrapper> implements IController {
    * @param slug 路径
    * @returns
    */
-  getBySlug(slug: string) {
-    return this.proxy.slug(slug).get<PageModel>({})
+  getBySlug(slug: string, options?: { prefer?: 'lexical' }) {
+    return this.proxy.slug(slug).get<PageModel>({
+      params: options?.prefer ? { prefer: options.prefer } : undefined,
+    })
   }
 }

@@ -5,22 +5,21 @@ import type {
   RequestProxyResult,
   ResponseProxyExtraRaw,
 } from '~/interfaces/request'
+import { attachRawFromOneToAnthor, destructureData } from '~/utils'
+import { autoBind } from '~/utils/auto-bind'
+
 import type { HTTPClient } from '../core/client'
+import { RequestError } from '../core/error'
 import type {
   CategoryEntries,
   CategoryModel,
   CategoryWithChildrenModel,
+  TagDetailPost,
   TagModel,
 } from '../models/category'
-import type { PostModel } from '../models/post'
-
-import { attachRawFromOneToAnthor, destructureData } from '~/utils'
-import { autoBind } from '~/utils/auto-bind'
-
-import { RequestError } from '../core/error'
 import { CategoryType } from '../models/category'
 
-declare module '../core/client' {
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -40,19 +39,16 @@ export class CategoryController<ResponseWrapper> implements IController {
     return this.client.proxy(this.base)
   }
 
-  getAllCategories(): RequestProxyResult<
-    { data: CategoryModel[] },
-    ResponseWrapper
-  > {
-    return this.proxy.get({
+  getAllCategories(): RequestProxyResult<CategoryModel[], ResponseWrapper> {
+    return this.proxy.get<CategoryModel[]>({
       params: {
         type: CategoryType.Category,
       },
     })
   }
 
-  getAllTags(): RequestProxyResult<{ data: TagModel[] }, ResponseWrapper> {
-    return this.proxy.get<{ data: TagModel[] }>({
+  getAllTags(): RequestProxyResult<TagModel[], ResponseWrapper> {
+    return this.proxy.get<TagModel[]>({
       params: {
         type: CategoryType.Tag,
       },
@@ -108,7 +104,7 @@ export class CategoryController<ResponseWrapper> implements IController {
   async getTagByName(name: string) {
     const res = await this.proxy(name).get<{
       tag: string
-      data: Pick<PostModel, 'id' | 'title' | 'slug' | 'category' | 'created'>[]
+      data: TagDetailPost[]
     }>({
       params: {
         tag: 1,

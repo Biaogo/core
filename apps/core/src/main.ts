@@ -1,33 +1,37 @@
 #!env node
 // register global
-import cluster from 'node:cluster'
+import 'dotenv-expand/config'
 
-import { DEBUG_MODE } from './app.config'
+import cluster from 'node:cluster'
+import { cpus } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { DEBUG_MODE } from './app.config.js'
 import { registerForMemoryDump } from './dump'
 import { logger } from './global/consola.global'
-import { isMainCluster, isMainProcess } from './global/env.global'
+import { isMainCluster } from './global/env.global'
 import { initializeApp } from './global/index.global'
-import { migrateDatabase } from './migration/migrate'
 
 process.title = `Mix Space (${cluster.isPrimary ? 'master' : 'worker'}) - ${
   process.env.NODE_ENV
 }`
 
-async function main() {
+export async function startMain() {
   initializeApp()
 
-  if (isMainProcess) {
-    await migrateDatabase()
-  }
-
+  const importStartedAt = performance.now()
   const [{ bootstrap }, { CLUSTER, ENCRYPT }, { Cluster }] = await Promise.all([
     import('./bootstrap'),
-    import('./app.config'),
+    import('./app.config.js'),
     import('./cluster'),
   ])
+  logger.log(
+    `Startup imports: ${Math.round(performance.now() - importStartedAt)}ms`,
+  )
 
   if (!CLUSTER.enable || cluster.isPrimary || isMainCluster) {
-    logger.debug(argv)
+    logger.debug(process.argv)
     logger.log('cwd: ', cwd)
   }
 
@@ -51,7 +55,7 @@ async function main() {
   DEBUG_MODE.memoryDump && registerForMemoryDump()
   if (CLUSTER.enable) {
     Cluster.register(
-      Number.parseInt(CLUSTER.workers) || os.cpus().length,
+      Number.parseInt(CLUSTER.workers) || cpus().length,
       bootstrap,
     )
   } else {
@@ -59,4 +63,16 @@ async function main() {
   }
 }
 
-main()
+function isCliEntry(): boolean {
+  try {
+    const here = fileURLToPath(import.meta.url)
+    const entry = process.argv[1] ? path.resolve(process.argv[1]) : ''
+    return here === entry
+  } catch {
+    return false
+  }
+}
+
+if (isCliEntry()) {
+  startMain()
+}

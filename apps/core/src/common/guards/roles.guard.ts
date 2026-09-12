@@ -1,61 +1,60 @@
 import type { CanActivate, ExecutionContext } from '@nestjs/common'
-
 import { Injectable } from '@nestjs/common'
 
 import { AuthService } from '~/modules/auth/auth.service'
 import { ConfigsService } from '~/modules/configs/configs.service'
-import { UserService } from '~/modules/user/user.service'
-import { getNestExecutionContextRequest } from '~/transformers/get-req.transformer'
+import { isHttpExecutionContext } from '~/transformers/get-req.transformer'
 
 import { AuthGuard } from './auth.guard'
-
-/**
- * 区分游客和主人的守卫
- */
 
 @Injectable()
 export class RolesGuard extends AuthGuard implements CanActivate {
   constructor(
     protected readonly authService: AuthService,
     protected readonly configs: ConfigsService,
-
-    protected readonly userService: UserService,
   ) {
-    super(authService, configs, userService)
+    super(authService)
   }
+
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (!isHttpExecutionContext(context)) {
+      return true
+    }
+
     const request = this.getRequest(context)
-    let isAuthenticated = false
+    let hasAdminAccess = false
     try {
       await super.canActivate(context)
-      isAuthenticated = true
+      hasAdminAccess = true
     } catch {}
 
     const session = await this.authService.getSessionUser(request.raw)
+    const readerId = session?.user?.id || request.user?.id
+    const authProvider = session?.provider
+    const hasReaderIdentity = !!readerId
 
-    if (session) {
-      const readerId = session.user?.id
-
+    if (readerId) {
       request.readerId = readerId
-
-      Object.assign(request.raw, {
-        readerId,
-      })
+      Object.assign(request.raw, { readerId })
     }
 
-    request.isGuest = !isAuthenticated
-    request.isAuthenticated = isAuthenticated
+    if (authProvider) {
+      request.authProvider = authProvider
+      Object.assign(request.raw, { authProvider })
+    }
+
+    request.hasAdminAccess = hasAdminAccess
+    request.hasReaderIdentity = hasReaderIdentity
+    request.isGuest = !hasReaderIdentity
+    request.isAuthenticated = hasAdminAccess
 
     Object.assign(request.raw, {
-      isGuest: !isAuthenticated,
-
-      isAuthenticated,
+      hasAdminAccess,
+      hasReaderIdentity,
+      isGuest: !hasReaderIdentity,
+      isAuthenticated: hasAdminAccess,
     })
 
     return true
-  }
-
-  getRequest(context: ExecutionContext) {
-    return getNestExecutionContextRequest(context)
   }
 }

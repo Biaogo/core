@@ -1,39 +1,33 @@
-import type { Socket } from 'socket.io'
+import { buildEnvelope } from '@mx-space/ws-client/protocol'
 
 import { BusinessEvents } from '~/constants/business-event.constant'
 
+import type { WsConnection } from './ws/ws.types'
+import { serializeEnvelope } from './ws/ws-envelope'
+
 export abstract class BaseGateway {
-  public gatewayMessageFormat(
-    type: BusinessEvents,
-    message: any,
-    code?: number,
-  ) {
-    return {
-      type,
-      data: JSON.parse(JSON.stringify(message)),
-      code,
-    }
+  protected sendTo(conn: WsConnection, event: string, payload?: unknown) {
+    if (conn.ws.readyState !== conn.ws.OPEN) return
+    conn.ws.send(serializeEnvelope(buildEnvelope(event, payload)))
   }
 
-  handleDisconnect(client: Socket) {
-    client.send(
-      this.gatewayMessageFormat(
-        BusinessEvents.GATEWAY_CONNECT,
-        'WebSocket 断开',
-      ),
-    )
+  protected sendConnectGreeting(conn: WsConnection) {
+    this.sendTo(conn, BusinessEvents.GATEWAY_CONNECT, 'WebSocket connected')
   }
-  handleConnect(client: Socket) {
-    client.send(
-      this.gatewayMessageFormat(
-        BusinessEvents.GATEWAY_CONNECT,
-        'WebSocket 已连接',
-      ),
+
+  protected sendDisconnectGreeting(conn: WsConnection) {
+    this.sendTo(
+      conn,
+      BusinessEvents.GATEWAY_DISCONNECT,
+      'WebSocket disconnected',
     )
   }
 
-  // eslint-disable-next-line unused-imports/no-unused-vars
-  broadcast(event: BusinessEvents, data: any) {}
+  abstract broadcast(
+    event: BusinessEvents,
+    data: any,
+    options?: { rooms?: string[]; exclude?: string[] },
+  ): void
 }
 
 export abstract class BroadcastBaseGateway extends BaseGateway {}

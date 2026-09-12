@@ -1,6 +1,9 @@
 import cdp, { exec } from 'node:child_process'
-import { builtinModules } from 'node:module'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
 import { promisify } from 'node:util'
+
+import { $ } from './shell.util'
 
 export async function getFolderSize(folderPath: string) {
   try {
@@ -16,32 +19,18 @@ export async function getFolderSize(folderPath: string) {
   }
 }
 
-export const formatByteSize = (byteSize: number) => {
-  let size: string
-  if (byteSize > 1024 * 1024 * 1024) {
-    size = `${(byteSize / 1024 / 1024 / 1024).toFixed(2)} GB`
-  } else if (byteSize > 1024 * 1024) {
-    size = `${(byteSize / 1024 / 1024).toFixed(2)} MB`
-  } else if (byteSize > 1024) {
-    size = `${(byteSize / 1024).toFixed(2)} KB`
-  } else {
-    size = `${byteSize} B`
-  }
-  return size
-}
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const
 
-export const isBuiltinModule = (module: string, ignoreList: string[] = []) => {
-  return (
-    // @ts-ignore
-    // eslint-disable-next-line node/no-deprecated-api
-    (builtinModules || (Object.keys(process.binding('natives')) as string[]))
-      .filter(
-        (x) =>
-          !/^_|^(?:internal|v8|node-inspect)\/|\//.test(x) &&
-          !ignoreList.includes(x),
-      )
-      .includes(module)
-  )
+export const formatByteSize = (byteSize: number) => {
+  let value = byteSize
+  let unitIndex = 0
+  while (value > 1024 && unitIndex < BYTE_UNITS.length - 1) {
+    value /= 1024
+    unitIndex++
+  }
+  return unitIndex === 0
+    ? `${value} ${BYTE_UNITS[unitIndex]}`
+    : `${value.toFixed(2)} ${BYTE_UNITS[unitIndex]}`
 }
 
 export type PackageManager = 'pnpm' | 'yarn' | 'npm'
@@ -58,10 +47,17 @@ const INSTALL_COMMANDS: Record<PackageManager, string> = {
   npm: 'install',
 }
 
+const SAFE_PKG_NAME = /^[\w@][\w./-]*(?:@[\w*.<=>^~-]+)?$/
+
 export const installPKG = async (name: string, cwd: string) => {
+  for (const segment of name.split(/\s+/)) {
+    if (!SAFE_PKG_NAME.test(segment)) {
+      throw new Error(`Invalid package name: ${segment}`)
+    }
+  }
   let manager: PackageManager | null = null
   for (const lock of Object.keys(LOCKS)) {
-    const isExist = await fs.pathExists(path.join(cwd, lock))
+    const isExist = existsSync(path.join(cwd, lock))
     if (isExist) {
       manager = LOCKS[lock]
       break
@@ -70,7 +66,7 @@ export const installPKG = async (name: string, cwd: string) => {
 
   if (!manager) {
     for (const managerName of Object.values(LOCKS)) {
-      const res = await $`${managerName} --version`.nothrow()
+      const res = await $(`${managerName} --version`)
       if (res.exitCode === 0) {
         manager = managerName
         break
@@ -79,21 +75,17 @@ export const installPKG = async (name: string, cwd: string) => {
   }
   if (!manager) {
     // fallback to npm
-    const npmVersion = await $`npm -v`.nothrow()
+    const npmVersion = await $('npm -v')
     if (npmVersion.exitCode === 0) {
       manager = 'npm'
     } else {
       throw new Error('No package manager found')
     }
   }
-  cd(cwd)
-  // await $`${manager} ${INSTALL_COMMANDS[manager]} ${name}`
-  const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash'
-  const pty = spawnShell(
-    shell,
-    ['-c', `${manager} ${INSTALL_COMMANDS[manager]} ${name}`],
-    {},
-  )
+  const names = name.split(/\s+/).filter(Boolean)
+  const pty = spawnShell(manager, [INSTALL_COMMANDS[manager], ...names], {
+    cwd,
+  })
 
   return pty
 }

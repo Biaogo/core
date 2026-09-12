@@ -1,151 +1,55 @@
-import { IsDefined, IsNumber } from 'class-validator'
-import { eventEmitterProvider } from 'test/mock/processors/event.mock'
-import type { ReturnModelType } from '@typegoose/typegoose'
+import { describe, expect, it, vi } from 'vitest'
 
-import { createE2EApp } from '@/helper/create-e2e-app'
-import { authPassHeader } from '@/mock/guard/auth.guard'
-import { modelOptions, prop } from '@typegoose/typegoose'
+import { BasePgCrudFactory } from '~/transformers/crud-factor.pg.transformer'
 
-import { BaseModel } from '~/shared/model/base.model'
-import { BaseCrudFactory } from '~/transformers/crud-factor.transformer'
+class ExampleRepository {
+  static name = 'ExampleRepository'
 
-@modelOptions({
-  options: {
-    customName: 'model-test',
-  },
-})
-class TestModel extends BaseModel {
-  @prop()
-  @IsNumber()
-  number: number
-
-  @prop()
-  @IsDefined()
-  foo: string
+  list = vi.fn()
+  findAll = vi.fn()
+  findById = vi.fn()
+  create = vi.fn()
+  update = vi.fn()
+  deleteById = vi.fn()
 }
-export class TestController extends BaseCrudFactory({ model: TestModel }) {}
 
-describe('BaseCrudFactory', () => {
-  let testingModel: ReturnModelType<typeof TestModel>
-  const proxy = createE2EApp({
-    controllers: [TestController],
-    providers: [...eventEmitterProvider],
-    models: [TestModel],
-    async pourData(modelMap) {
-      const model = modelMap.get(TestModel)
-      testingModel = model.model as any
-
-      await model.model.create([
-        {
-          number: 1,
-          foo: 'bar',
-        },
-      ])
-
-      return async () => {
-        return model.model.deleteMany({})
-      }
-    },
-  })
-
-  afterAll(() => {
-    testingModel = null
-  })
-
-  test('GET /tests', async () => {
-    const { app } = proxy
-    const res = await app.inject({
-      method: 'GET',
-      url: '/tests',
+describe('BasePgCrudFactory', () => {
+  it('routes creates through the injected PG repository and broadcasts events', async () => {
+    const Controller = BasePgCrudFactory({
+      repository: ExampleRepository as any,
     })
-    const data = res.json()
-    expect(res.statusCode).toBe(200)
+    const repository = new ExampleRepository()
+    repository.create.mockResolvedValue({ id: 'row-1' })
+    const eventManager = { broadcast: vi.fn() }
+    const controller = new Controller(repository, eventManager)
 
-    data.data.forEach((item) => {
-      delete item.id
-      delete item.created
-    })
-    expect(data).toMatchSnapshot()
-  })
-
-  test('POST /tests', async () => {
-    const { app } = proxy
-    const res = await app.inject({
-      method: 'POST',
-      url: '/tests',
-      headers: {
-        ...authPassHeader,
-      },
-      payload: {
-        number: 2,
-        foo: 'bar',
-      },
-    })
-    const data = res.json()
-    expect(res.statusCode).toBe(201)
-    delete data.id
-    delete data.created
-    expect(data).toMatchSnapshot()
-  })
-
-  test('POST /tests should throw 422', async () => {
-    const { app } = proxy
-    const res = await app.inject({
-      method: 'POST',
-      url: '/tests',
-      headers: {
-        ...authPassHeader,
-      },
-      payload: {
-        number: true,
-      },
-    })
-    expect(res.statusCode).toBe(422)
-  })
-
-  test('PATCH /tests/:id', async () => {
-    const { app } = proxy
-    const docId = await testingModel
-      .findOne()
-      .lean()
-      .then((doc) => doc?.id)
-
-    const res = await app.inject({
-      method: 'PATCH',
-      url: `/tests/${docId}`,
-      headers: {
-        ...authPassHeader,
-      },
-      payload: {
-        number: 3,
-      },
+    await expect(controller.create({ title: 'Row' })).resolves.toEqual({
+      id: 'row-1',
     })
 
-    expect(res.statusCode).toBe(204)
-
-    const doc = await testingModel.findById(docId).lean()
-    expect(doc.number).toBe(3)
+    expect(repository.create).toHaveBeenCalledWith({ title: 'Row' })
+    expect(eventManager.broadcast).toHaveBeenCalledWith(
+      'example.create',
+      { id: 'row-1' },
+      expect.any(Object),
+    )
   })
 
-  test('DELETE /tests/:id', async () => {
-    const { app } = proxy
-    const docId = await testingModel
-      .findOne()
-      .lean()
-      .then((doc) => doc?.id)
-
-    const res = await app.inject({
-      method: 'delete',
-      url: `/tests/${docId}`,
-      headers: {
-        ...authPassHeader,
-      },
+  it('uses repository deleteById for deletes and emits the PG delete event', async () => {
+    const Controller = BasePgCrudFactory({
+      repository: ExampleRepository as any,
     })
+    const repository = new ExampleRepository()
+    const eventManager = { broadcast: vi.fn() }
+    const controller = new Controller(repository, eventManager)
 
-    expect(res.statusCode).toBe(204)
+    await controller.delete({ id: 'row-1' })
 
-    const docs = await testingModel.find()
-
-    expect(docs.find((d) => d.id === docId)).toBe(undefined)
+    expect(repository.deleteById).toHaveBeenCalledWith('row-1')
+    expect(eventManager.broadcast).toHaveBeenCalledWith(
+      'example.delete',
+      { id: 'row-1' },
+      expect.any(Object),
+    )
   })
 })

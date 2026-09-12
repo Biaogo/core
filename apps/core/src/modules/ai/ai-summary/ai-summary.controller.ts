@@ -6,104 +6,191 @@ import {
   Patch,
   Post,
   Query,
-  Req,
+  Res,
 } from '@nestjs/common'
+import type { FastifyReply } from 'fastify'
 
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import { BizException } from '~/common/exceptions/biz.exception'
-import { ErrorCodeEnum } from '~/constants/error-code.constant'
-import { MongoIdDto } from '~/shared/dto/id.dto'
-import { PagerDto } from '~/shared/dto/pager.dto'
-import { FastifyBizRequest } from '~/transformers/get-req.transformer'
-
-import { ConfigsService } from '../../configs/configs.service'
-import { DEFAULT_SUMMARY_LANG } from '../ai.constants'
+import { HTTPDecorators } from '~/common/decorators/http.decorator'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { withMeta } from '~/common/response/envelope.types'
+import { MetaObjectBuilder } from '~/common/response/meta-builder'
 import {
-  GenerateAiSummaryDto,
-  GetSummaryQueryDto,
-  UpdateSummaryDto,
-} from './ai-summary.dto'
+  type CreateSummaryTaskDto,
+  CreateSummaryTaskSchema,
+  type CreateSummaryTranslationTaskDto,
+  CreateSummaryTranslationTaskSchema,
+} from '~/modules/ai/ai-task/ai-task.dto'
+import { AiTaskService } from '~/modules/ai/ai-task/ai-task.service'
+import { PostMetaBuilder } from '~/modules/post/post-meta-builder'
+import { type EntityIdDto, EntityIdSchema } from '~/shared/dto/id.dto'
+import { type BasicPagerDto, BasicPagerSchema } from '~/shared/dto/pager.dto'
+import { endSse, initSse, sendSseEvent } from '~/utils/sse.util'
+
+import { DEFAULT_SUMMARY_LANG } from '../ai.constants'
+import { parseLanguageCode } from '../ai-language.util'
+import {
+  type GetSummariesGroupedQueryDto,
+  GetSummariesGroupedQuerySchema,
+  type GetSummaryQueryDto,
+  GetSummaryQuerySchema,
+  type GetSummaryStreamQueryDto,
+  GetSummaryStreamQuerySchema,
+  type UpdateSummaryDto,
+  UpdateSummarySchema,
+} from './ai-summary.schema'
 import { AiSummaryService } from './ai-summary.service'
 
 @ApiController('ai/summaries')
 export class AiSummaryController {
   constructor(
     private readonly service: AiSummaryService,
-    private readonly configService: ConfigsService,
+    private readonly taskService: AiTaskService,
   ) {}
 
-  @Post('/generate')
+  @Post('/task')
   @Auth()
-  generateSummary(@Body() body: GenerateAiSummaryDto) {
-    return this.service.generateSummaryByOpenAI(body.refId, body.lang)
+  createSummaryTask(
+    @Body({ schema: CreateSummaryTaskSchema }) body: CreateSummaryTaskDto,
+  ) {
+    return this.taskService.createSummaryTask(body)
+  }
+
+  @Post('/task/translate')
+  @Auth()
+  async createSummaryTranslationTask(
+    @Body({ schema: CreateSummaryTranslationTaskSchema })
+    body: CreateSummaryTranslationTaskDto,
+  ) {
+    const source = await this.service.findBaseSummaryForArticle(body.refId)
+    if (!source) {
+      return { taskId: null, created: false, reason: 'source-missing' }
+    }
+    const sourceLang = source.sourceLang || source.lang
+    if (body.targetLang === sourceLang) {
+      throw createAppException(AppErrorCode.AI_INVALID_PARAMETER, {
+        message: 'targetLang must differ from source lang',
+      })
+    }
+    return this.taskService.createSummaryTranslationTask({
+      refId: body.refId,
+      sourceSummaryId: source.id!,
+      targetLang: body.targetLang,
+      force: body.force,
+    })
   }
 
   @Get('/ref/:id')
   @Auth()
-  async getSummaryByRefId(@Param() params: MongoIdDto) {
+  getSummaryByRefId(@Param({ schema: EntityIdSchema }) params: EntityIdDto) {
     return this.service.getSummariesByRefId(params.id)
   }
 
   @Get('/')
   @Auth()
-  async getSummaries(@Query() query: PagerDto) {
-    return this.service.getAllSummaries(query)
+  async getSummaries(
+    @Query({ schema: BasicPagerSchema }) query: BasicPagerDto,
+  ) {
+    const result = await this.service.getAllSummaries(query)
+    return withMeta(
+      result.data,
+      new PostMetaBuilder()
+        .pagination(result.pagination)
+        .articles(result.articles)
+        .build(),
+    )
+  }
+
+  @Get('/grouped')
+  @Auth()
+  async getSummariesGrouped(
+    @Query({ schema: GetSummariesGroupedQuerySchema })
+    query: GetSummariesGroupedQueryDto,
+  ) {
+    const result = await this.service.getAllSummariesGrouped(query)
+    return withMeta(
+      result.data,
+      new MetaObjectBuilder().pagination(result.pagination).build(),
+    )
   }
 
   @Patch('/:id')
   @Auth()
-  async updateSummary(
-    @Param() params: MongoIdDto,
-    @Body() body: UpdateSummaryDto,
+  updateSummary(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: UpdateSummarySchema }) body: UpdateSummaryDto,
   ) {
     return this.service.updateSummaryInDb(params.id, body.summary)
   }
 
   @Delete('/:id')
   @Auth()
-  async deleteSummary(@Param() params: MongoIdDto) {
+  deleteSummary(@Param({ schema: EntityIdSchema }) params: EntityIdDto) {
     return this.service.deleteSummaryInDb(params.id)
   }
 
   @Get('/article/:id')
-  async getArticleSummary(
-    @Param() params: MongoIdDto,
-    @Query() query: GetSummaryQueryDto,
-    @Req() req: FastifyBizRequest,
+  getArticleSummary(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Query({ schema: GetSummaryQuerySchema }) query: GetSummaryQueryDto,
   ) {
-    const acceptLang = req.headers['accept-language']
-    const nextLang = query.lang || acceptLang
-    const autoDetectedLanguage =
-      nextLang?.split('-').shift() || DEFAULT_SUMMARY_LANG
-    const targetLanguage = await this.configService
-      .get('ai')
-      .then((c) => c.aiSummaryTargetLanguage)
-      .then((targetLanguage) =>
-        targetLanguage === 'auto' ? autoDetectedLanguage : targetLanguage,
-      )
+    return this.service.getOrGenerateSummaryForArticle(params.id, {
+      lang: query.lang ? parseLanguageCode(query.lang) : DEFAULT_SUMMARY_LANG,
+      onlyDb: query.onlyDb,
+    })
+  }
 
-    const dbStored = await this.service.getSummaryByArticleId(
-      params.id,
-      targetLanguage,
-    )
+  @Get('/article/:id/generate')
+  @HTTPDecorators.RawResponse
+  async generateArticleSummary(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Query({ schema: GetSummaryStreamQuerySchema })
+    query: GetSummaryStreamQueryDto,
+    @Res() reply: FastifyReply,
+  ) {
+    initSse(reply)
 
-    const aiConfig = await this.configService.get('ai')
-    if (!dbStored && !query.onlyDb) {
-      const shouldGenerate =
-        aiConfig?.enableAutoGenerateSummary && aiConfig.enableSummary
-      if (shouldGenerate) {
-        return this.service.generateSummaryByOpenAI(params.id, targetLanguage)
+    let closed = false
+    reply.raw.on('close', () => {
+      closed = true
+    })
+
+    try {
+      const { events } = await this.service.streamSummaryForArticle(params.id, {
+        lang: query.lang ? parseLanguageCode(query.lang) : DEFAULT_SUMMARY_LANG,
+      })
+
+      let sentToken = false
+      for await (const event of events) {
+        if (closed) break
+        // Public SSE wire safety: drop spec-2 'partial' frames; only
+        // token/done/error are part of the byte-pinned public envelope.
+        if (event.type === 'partial') continue
+        if (event.type === 'token') {
+          sendSseEvent(reply, 'token', event.data)
+          sentToken = true
+        } else if (event.type === 'done') {
+          if (!sentToken) {
+            const doc = await this.service.getSummaryById(event.data.resultId)
+            sendSseEvent(reply, 'token', doc)
+          }
+          sendSseEvent(reply, 'done', undefined)
+        } else {
+          sendSseEvent(reply, 'error', event.data)
+        }
+        if (event.type === 'done' || event.type === 'error') break
+      }
+    } catch (error) {
+      if (!closed) {
+        sendSseEvent(reply, 'error', {
+          message: (error as Error)?.message || 'AI stream error',
+        })
+      }
+    } finally {
+      if (!closed) {
+        endSse(reply)
       }
     }
-
-    if (
-      !dbStored &&
-      (!aiConfig.enableSummary || !aiConfig.enableAutoGenerateSummary)
-    ) {
-      throw new BizException(ErrorCodeEnum.AINotEnabled)
-    }
-
-    return dbStored
   }
 }

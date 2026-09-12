@@ -1,25 +1,24 @@
-import { catchError, tap } from 'rxjs'
 import type {
   CallHandler,
   ExecutionContext,
   NestInterceptor,
 } from '@nestjs/common'
-import type { FastifyRequest } from 'fastify'
-
 import {
   ConflictException,
-  Inject,
   Injectable,
+  Logger,
   SetMetadata,
 } from '@nestjs/common'
 import { Reflector } from '@nestjs/core'
+import type { FastifyRequest } from 'fastify'
+import { catchError, tap } from 'rxjs'
 
 import {
   HTTP_IDEMPOTENCE_KEY,
   HTTP_IDEMPOTENCE_OPTIONS,
 } from '~/constants/meta.constant'
-import { REFLECTOR } from '~/constants/system.constant'
 import { RedisService } from '~/processors/redis/redis.service'
+import { isHttpExecutionContext } from '~/transformers/get-req.transformer'
 import { getIp } from '~/utils/ip.util'
 import { getRedisKey } from '~/utils/redis.util'
 import { hashString } from '~/utils/tool.util'
@@ -31,23 +30,24 @@ export type IdempotenceOption = {
   pendingMessage?: string
 
   /**
-   * 如果重复请求的话，手动处理异常
+   * Custom handler invoked when a duplicate request is detected.
    */
   handler?: (req: FastifyRequest) => any
 
   /**
-   * 记录重复请求的时间
+   * How long (in seconds) the idempotence record is retained.
    * @default 60
    */
   expired?: number
 
   /**
-   * 如果 header 没有幂等 key，根据 request 生成 key，如何生成这个 key 的方法
+   * How to derive the idempotence key from the request when no key
+   * is provided in the header.
    */
   generateKey?: (req: FastifyRequest) => string
 
   /**
-   * 仅读取 header 的 key，不自动生成
+   * Only honor the header key; do not auto-generate one.
    * @default false
    */
   disableGenerateKey?: boolean
@@ -55,15 +55,20 @@ export type IdempotenceOption = {
 
 @Injectable()
 export class IdempotenceInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(IdempotenceInterceptor.name)
+
   constructor(
     private readonly redisService: RedisService,
-    @Inject(REFLECTOR) private readonly reflector: Reflector,
+    private readonly reflector: Reflector,
   ) {}
 
   async intercept(context: ExecutionContext, next: CallHandler) {
+    if (!isHttpExecutionContext(context)) {
+      return next.handle()
+    }
+
     const request = context.switchToHttp().getRequest<FastifyRequest>()
 
-    // skip Get 请求
     if (request.method.toUpperCase() === 'GET') {
       return next.handle()
     }
@@ -79,8 +84,8 @@ export class IdempotenceInterceptor implements NestInterceptor {
     }
 
     const {
-      errorMessage = '相同请求成功后在 60 秒内只能发送一次',
-      pendingMessage = '相同请求正在处理中...',
+      errorMessage = 'The same request can only be sent once within 60 seconds after success',
+      pendingMessage = 'The same request is already being processed...',
       handler: errorHandler,
       expired = 60,
       disableGenerateKey = false,
@@ -100,30 +105,41 @@ export class IdempotenceInterceptor implements NestInterceptor {
     SetMetadata(HTTP_IDEMPOTENCE_KEY, idempotenceKey)(handler)
 
     if (idempotenceKey) {
-      const resultValue: '0' | '1' | null = (await redis.get(
-        idempotenceKey,
-      )) as any
-      if (resultValue !== null) {
-        if (errorHandler) {
-          return await errorHandler(request)
-        }
+      try {
+        const resultValue: '0' | '1' | null = (await redis.get(
+          idempotenceKey,
+        )) as any
+        if (resultValue !== null) {
+          if (errorHandler) {
+            return await errorHandler(request)
+          }
 
-        const message = {
-          1: errorMessage,
-          0: pendingMessage,
-        }[resultValue]
-        throw new ConflictException(message)
-      } else {
-        await redis.set(idempotenceKey, '0', 'EX', expired)
+          const message = {
+            1: errorMessage,
+            0: pendingMessage,
+          }[resultValue]
+          throw new ConflictException(message)
+        } else {
+          await redis.set(idempotenceKey, '0', 'EX', expired)
+        }
+      } catch (err) {
+        if (err instanceof ConflictException) throw err
+        this.logger.warn(
+          `Idempotence check failed, skipping: ${(err as Error).message}`,
+        )
       }
     }
     return next.handle().pipe(
       tap(async () => {
-        idempotenceKey && (await redis.set(idempotenceKey, '1', 'KEEPTTL'))
+        try {
+          idempotenceKey && (await redis.set(idempotenceKey, '1', 'KEEPTTL'))
+        } catch {
+          // Redis failure on completion mark is non-critical
+        }
       }),
       catchError(async (err) => {
         if (idempotenceKey) {
-          await redis.del(idempotenceKey)
+          await redis.del(idempotenceKey).catch(() => {})
         }
         throw err
       }),

@@ -1,51 +1,54 @@
 import cluster from 'node:cluster'
 import { performance } from 'node:perf_hooks'
-import wcmatch from 'wildcard-match'
-import type { FastifyCorsOptions } from '@fastify/cors'
-import type { LogLevel } from '@nestjs/common'
-import type { NestFastifyApplication } from '@nestjs/platform-fastify'
 
+import type { FastifyCorsOptions } from '@fastify/cors'
 import { Logger } from '@innei/pretty-logger-nestjs'
 import { NestFactory } from '@nestjs/core'
+import type { NestFastifyApplication } from '@nestjs/platform-fastify'
+import pc from 'picocolors'
+import wcmatch from 'wildcard-match'
 
-import { CROSS_DOMAIN, DEBUG_MODE, PORT } from './app.config'
+import { CROSS_DOMAIN, DEBUG_MODE, PORT, TELEMETRY } from './app.config'
 import { AppModule } from './app.module'
 import { fastifyApp } from './common/adapters/fastify.adapter'
-import { RedisIoAdapter } from './common/adapters/socket.adapter'
-import { SpiderGuard } from './common/guards/spider.guard'
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor'
-import { ExtendedValidationPipe } from './common/pipes/validation.pipe'
+import { requestCaseNormalizationPipeInstance } from './common/pipes/case-normalization.pipe'
+import { standardSchemaValidationPipeInstance } from './common/zod'
+import { AppMigrationsService } from './database/app-migrations/app-migrations.service'
 import { logger } from './global/consola.global'
-import { isMainProcess, isTest } from './global/env.global'
+import { isDev, isMainProcess, isTest } from './global/env.global'
+import { createWsAdapter } from './processors/gateway/ws/ws-adapter.factory'
 import { checkInit } from './utils/check-init.util'
+import {
+  sendTelemetry,
+  startHeartbeat,
+  stopHeartbeat,
+} from './utils/telemetry.util'
 
 const Origin: false | string[] = Array.isArray(CROSS_DOMAIN.allowedOrigins)
-  ? [...CROSS_DOMAIN.allowedOrigins, '*.shizuri.net', '22333322.xyz']
+  ? [...CROSS_DOMAIN.allowedOrigins]
   : false
 
-declare const module: any
-
 export async function bootstrap() {
+  const startedAt = performance.now()
   const isInit = await checkInit()
+  const checkedAt = performance.now()
 
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule.register(isInit),
     fastifyApp,
-    {
-      logger: ['error'].concat(
-        isDev || DEBUG_MODE.logging
-          ? (['debug'] as any as LogLevel[])
-          : ([] as LogLevel[]),
-      ) as LogLevel[],
-    },
   )
+  const createdAt = performance.now()
+
+  // Replace NestJS built-in logger with our custom Logger
+  app.useLogger(app.get(Logger))
 
   const allowAllCors: FastifyCorsOptions = {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     origin: (origin, callback) => callback(null, origin || ''),
   }
-  // Origin 如果不是数组就全部允许跨域
+  // If Origin is not an array, allow all cross-origin requests
 
   app.enableCors(
     isDev
@@ -79,9 +82,22 @@ export async function bootstrap() {
     app.useGlobalInterceptors(new LoggingInterceptor())
   }
 
-  app.useGlobalPipes(ExtendedValidationPipe.shared)
-  app.useGlobalGuards(new SpiderGuard())
-  !isTest && app.useWebSocketAdapter(new RedisIoAdapter(app))
+  app.useGlobalPipes(
+    requestCaseNormalizationPipeInstance,
+    standardSchemaValidationPipeInstance,
+  )
+  app.useWebSocketAdapter(createWsAdapter(app))
+
+  // Dev runs app-data migrations inline; prod boots them via the standalone
+  // `app-migrate.ts` CLI invoked by docker `mx-migrate`. Both paths share the
+  // same `AppMigrationsService` and respect the advisory lock + ledger, so
+  // multiple cluster workers / replicas hitting this concurrently is safe.
+  if (isDev && !isTest) {
+    await app.get(AppMigrationsService).run()
+  }
+  const migratedAt = performance.now()
+  await app.init()
+  const initializedAt = performance.now()
 
   await app.listen(
     {
@@ -89,7 +105,13 @@ export async function bootstrap() {
       port: +PORT,
     },
     async () => {
-      app.useLogger(app.get(Logger))
+      logger.info(
+        `Startup phases: database=${Math.round(checkedAt - startedAt)}ms ` +
+          `container=${Math.round(createdAt - checkedAt)}ms ` +
+          `setup/migrations=${Math.round(migratedAt - createdAt)}ms ` +
+          `app.init=${Math.round(initializedAt - migratedAt)}ms ` +
+          `listen=${Math.round(performance.now() - initializedAt)}ms`,
+      )
       logger.info('ENV:', process.env.NODE_ENV)
       const url = await app.getUrl()
       const pid = process.pid
@@ -109,14 +131,31 @@ export async function bootstrap() {
       logger.info(
         `[${prefix + pid}] If you want to debug local dev dashboard on dev environment with same site domain, you can go to: http://localhost:2333/proxy/qaqdmin/dev-proxy`,
       )
-      logger.info(
-        `Server is up. ${chalk.yellow(`+${performance.now() | 0}ms`)}`,
-      )
+      logger.info(`Server is up. ${pc.yellow(`+${performance.now() | 0}ms`)}`)
+
+      if (TELEMETRY.enable) {
+        logger.info(
+          '[Telemetry] Anonymous telemetry is enabled. To disable, use --disable_telemetry or set MX_DISABLE_TELEMETRY=true',
+        )
+        sendTelemetry('startup')
+        startHeartbeat()
+      } else {
+        logger.info('[Telemetry] Telemetry is disabled.')
+      }
+
+      // process.once: second Ctrl+C falls through to Node default for force-kill.
+      const shutdown = async (signal: NodeJS.Signals) => {
+        logger.info(`Received ${signal}, shutting down...`)
+        if (TELEMETRY.enable) stopHeartbeat()
+        try {
+          await app.close()
+        } catch (e) {
+          logger.error('Error during shutdown:', e)
+        }
+        process.exit(0)
+      }
+      process.once('SIGINT', shutdown)
+      process.once('SIGTERM', shutdown)
     },
   )
-
-  if (module.hot) {
-    module.hot.accept()
-    module.hot.dispose(() => app.close())
-  }
 }

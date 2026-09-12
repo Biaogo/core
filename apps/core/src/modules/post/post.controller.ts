@@ -1,226 +1,561 @@
-import type { PipelineStage } from 'mongoose'
-import type { CategoryModel } from '../category/category.model'
-
-import {
-  Body,
-  Delete,
-  Get,
-  Param,
-  Patch,
-  Post,
-  Put,
-  Query,
-} from '@nestjs/common'
+import { Body, Delete, Get, Param, Patch, Query } from '@nestjs/common'
 
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import { HTTPDecorators, Paginator } from '~/common/decorators/http.decorator'
-import { IpLocation, IpRecord } from '~/common/decorators/ip.decorator'
-import { CannotFindException } from '~/common/exceptions/cant-find.exception'
+import { BypassCaseTransform } from '~/common/decorators/bypass-case-transform.decorator'
+import { CurrentReaderId } from '~/common/decorators/current-user.decorator'
+import { IpLocation, type IpRecord } from '~/common/decorators/ip.decorator'
+import { Lang } from '~/common/decorators/lang.decorator'
+import { HasAdminAccess } from '~/common/decorators/role.decorator'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { withMeta } from '~/common/response/envelope.types'
+import type {
+  ArticleTranslation,
+  EnrichmentEntry,
+} from '~/common/response/meta.types'
+import { MetaObjectBuilder } from '~/common/response/meta-builder'
+import { TranslationEntryService } from '~/modules/ai/ai-translation/translation-entry.service'
+import { EntitlementService } from '~/modules/membership/entitlement.service'
 import { CountingService } from '~/processors/helper/helper.counting.service'
-import { MongoIdDto } from '~/shared/dto/id.dto'
-import { addYearCondition } from '~/transformers/db-query.transformer'
+import {
+  applyArticleTranslationInPlace,
+  applyTranslationEntriesInPlace,
+  type ArticleTranslationInput,
+  buildArticleTranslationMeta,
+  buildTagGlossary,
+  type EntryMaps,
+  type EntryRule,
+  TranslationService,
+} from '~/processors/helper/helper.translation.service'
+import {
+  renderTeaserText,
+  resolveEffectivePreviewBlocks,
+  truncateLexicalContent,
+} from '~/processors/helper/lexical-truncate.util'
+import { type EntityIdDto, EntityIdSchema } from '~/shared/dto/id.dto'
 
-import { CategoryAndSlugDto, PostPagerDto } from './post.dto'
-import { PartialPostModel, PostModel } from './post.model'
+import { AiInsightsService } from '../ai/ai-insights/ai-insights.service'
+import { parseLanguageCode } from '../ai/ai-language.util'
+import { AiSummaryService } from '../ai/ai-summary/ai-summary.service'
+import { AiTtsQueryService } from '../ai/ai-tts/ai-tts-query.service'
+import { EnrichmentService } from '../enrichment/enrichment.service'
+import { SnippetService } from '../snippet/snippet.service'
+import {
+  type CategoryAndSlugDto,
+  CategoryAndSlugSchema,
+  type PartialPostDto,
+  PartialPostSchema,
+  type PostDetailQueryDto,
+  PostDetailQuerySchema,
+  type PostPagerDto,
+  PostPagerSchema,
+  type SetPostPublishStatusDto,
+  SetPostPublishStatusSchema,
+} from './post.schema'
 import { PostService } from './post.service'
+import type { PostModel } from './post.types'
+import { PostMetaBuilder } from './post-meta-builder'
+
+const CATEGORY_NAME_RULES: ReadonlyArray<EntryRule> = [
+  {
+    path: 'category.name',
+    keyPath: 'category.name',
+    mode: 'entity',
+    idField: 'id',
+  },
+]
 
 @ApiController('posts')
 export class PostController {
   constructor(
     private readonly postService: PostService,
     private readonly countingService: CountingService,
+    private readonly translationService: TranslationService,
+    private readonly aiInsightsService: AiInsightsService,
+    private readonly aiSummaryService: AiSummaryService,
+    private readonly aiTtsQueryService: AiTtsQueryService,
+    private readonly enrichmentService: EnrichmentService,
+    private readonly translationEntryService: TranslationEntryService,
+    private readonly snippetService: SnippetService,
+    private readonly entitlementService: EntitlementService,
   ) {}
 
-  @Get('/')
-  @Paginator
-  async getPaginate(@Query() query: PostPagerDto) {
-    const { size, select, page, year, sortBy, sortOrder, truncate } = query
+  private async applyPaywall(
+    doc: Record<string, any>,
+    isOwner: boolean,
+    readerId?: string,
+  ): Promise<{ locked: boolean; previewBlocks?: number } | null> {
+    if (!doc.isPremium) return null
 
-    return this.postService.model
-      .aggregatePaginate(
-        this.postService.model.aggregate(
-          [
-            {
-              $match: {
-                ...addYearCondition(year),
-              },
-            },
-            // @see https://stackoverflow.com/questions/54810712/mongodb-sort-by-field-a-if-field-b-null-otherwise-sort-by-field-c
-            {
-              $addFields: {
-                sortField: {
-                  // create a new field called "sortField"
-                  $cond: {
-                    // and assign a value that depends on
-                    if: { $ne: ['$pin', null] }, // whether "b" is not null
-                    then: '$pinOrder', // in which case our field shall hold the value of "a"
-                    else: '$$REMOVE',
-                  },
-                },
-              },
-            },
-            {
-              $sort: sortBy
-                ? {
-                    [sortBy]: sortOrder as any,
-                  }
-                : {
-                    sortField: -1, // sort by our computed field
-                    pin: -1,
-                    created: -1, // and then by the "created" field
-                  },
-            },
-            {
-              $project: {
-                sortField: 0, // remove "sort" field if needed
-              },
-            },
-            select && {
-              $project: {
-                ...(select?.split(' ').reduce(
-                  (acc, cur) => {
-                    const field = cur.trim()
-                    acc[field] = 1
-                    return acc
-                  },
-                  Object.keys(new PostModel()).map((k) => ({ [k]: 0 })),
-                ) as any),
-              },
-            },
-            {
-              $lookup: {
-                from: 'categories',
-                localField: 'categoryId',
-                foreignField: '_id',
-                as: 'category',
-              },
-            },
-            {
-              $unwind: {
-                path: '$category',
-                preserveNullAndEmptyArrays: true,
-              },
-            },
-          ].filter(Boolean) as PipelineStage[],
-        ),
-        {
-          limit: size,
-          page,
-        },
-      )
-      .then((res) => {
-        res.docs = res.docs.map((doc: PostModel) => {
-          doc.text = truncate ? doc.text.slice(0, truncate) : doc.text
-          if (doc.meta && typeof doc.meta === 'string') {
-            doc.meta = JSON.safeParse(doc.meta as string) || doc.meta
-          }
-          return doc
+    if (!(await this.entitlementService.isMembershipPurchasable())) return null
+
+    const isEntitled = await this.entitlementService.isEntitledToPremium({
+      isOwner,
+      readerId,
+    })
+
+    if (isEntitled) {
+      return { locked: false }
+    }
+
+    const previewBlocks = this.applyPaywallTeaser(doc)
+    return { locked: true, previewBlocks }
+  }
+
+  private applyPaywallTeaser(doc: Record<string, any>): number {
+    const effectiveN = resolveEffectivePreviewBlocks(
+      doc.content,
+      (doc.meta as any)?.paywall?.previewBlocks,
+    )
+    doc.content = truncateLexicalContent(doc.content, effectiveN)
+    doc.text = renderTeaserText(doc.content)
+    return effectiveN
+  }
+
+  private async batchEntryTranslations(
+    lang: string,
+    posts: Array<
+      | { category?: { id: unknown } | null; tags?: string[] | null }
+      | null
+      | undefined
+    >,
+  ): Promise<EntryMaps> {
+    const categoryIds = new Set<string>()
+    const tags = new Set<string>()
+    for (const post of posts) {
+      if (post?.category?.id) categoryIds.add(String(post.category.id))
+      for (const tag of post?.tags ?? []) tags.add(tag)
+    }
+    return this.translationEntryService.getTranslationsBatch(lang, {
+      entityLookups: categoryIds.size
+        ? [{ keyPath: 'category.name', lookupKeys: categoryIds }]
+        : [],
+      dictLookups: tags.size
+        ? [{ keyPath: 'post.tag', sourceTexts: tags }]
+        : [],
+    })
+  }
+
+  private applyTagGlossary(
+    metaBuilder: MetaObjectBuilder<any>,
+    entryMaps: EntryMaps,
+  ) {
+    const tags = buildTagGlossary(entryMaps)
+    if (tags.length) metaBuilder.glossary({ tags })
+  }
+
+  @Get('/')
+  async getPaginate(
+    @Query({ schema: PostPagerSchema }) query: PostPagerDto,
+    @HasAdminAccess() isAuthenticated: boolean,
+    @Lang() lang?: string,
+  ) {
+    const {
+      size,
+      page,
+      year,
+      sortBy,
+      sortOrder,
+      truncate,
+      categoryIds,
+      excludeAiWritten,
+    } = query
+
+    const res = await this.postService.listPaginated({
+      size,
+      page,
+      year,
+      categoryIds,
+      excludeAiWritten,
+      publishedOnly: !isAuthenticated,
+      sortBy: sortBy as any,
+      sortOrder: sortOrder === 'asc' ? 1 : -1,
+      truncateText: truncate,
+    })
+
+    // With SQL-side truncation the snapshot text is partial — hand the
+    // freshness check empty sources so it re-verifies hashes from the DB
+    // instead of mismatching against truncated text.
+    const articleInputs: ArticleTranslationInput[] = res.data
+      .filter((doc) => typeof doc.text === 'string')
+      .map((doc) => ({
+        id: String(doc.id),
+        title: doc.title,
+        text: truncate ? '' : doc.text,
+        meta: doc.meta as { lang?: string } | undefined,
+        contentFormat: doc.contentFormat,
+        content: truncate ? undefined : doc.content,
+        modifiedAt: doc.modifiedAt,
+        createdAt: doc.createdAt,
+      }))
+
+    const [{ results: translationResults, meta: translationMeta }, entryMaps] =
+      await Promise.all([
+        this.translationService.collectArticleTranslations({
+          articles: articleInputs,
+          targetLang: lang,
+          fields: ['title', 'text', 'content', 'contentFormat'],
+        }),
+        this.batchEntryTranslations(lang ?? '', res.data),
+      ])
+
+    for (const doc of res.data) {
+      const tr = translationResults.get(String(doc.id))
+      if (tr?.isTranslated) {
+        applyArticleTranslationInPlace(doc as Record<string, any>, tr as any, {
+          fields: ['title', 'text', 'content', 'contentFormat'],
         })
-        return res
-      })
+      }
+    }
+
+    if (lang) {
+      for (const doc of res.data) {
+        applyTranslationEntriesInPlace(
+          doc as Record<string, any>,
+          entryMaps,
+          CATEGORY_NAME_RULES,
+        )
+      }
+    }
+
+    for (const doc of res.data) {
+      if (doc.isPremium) {
+        if (typeof doc.content === 'string') {
+          this.applyPaywallTeaser(doc as Record<string, any>)
+        } else {
+          doc.text = ''
+        }
+        continue
+      }
+
+      if (truncate) {
+        doc.text = doc.text.slice(0, truncate)
+        doc.content = null
+      }
+    }
+
+    const metaBuilder = new MetaObjectBuilder().view('card').pagination({
+      page: res.pagination.currentPage,
+      size: res.pagination.size,
+      total: res.pagination.total,
+      totalPages: res.pagination.totalPage,
+    })
+
+    if (translationMeta.size > 0) {
+      metaBuilder.translation(translationMeta)
+    }
+    if (lang) this.applyTagGlossary(metaBuilder, entryMaps)
+
+    return withMeta(res.data, metaBuilder.build())
   }
 
   @Get('/get-url/:slug')
   async getBySlug(@Param('slug') slug: string) {
     if (typeof slug !== 'string') {
-      throw new CannotFindException()
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
     }
-    const doc = await this.postService.model.findOne({ slug })
+    const doc = await this.postService.findBySlug(slug)
     if (!doc) {
-      throw new CannotFindException()
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
     }
 
     return {
-      path: `/${(doc.category as CategoryModel).slug}/${doc.slug}`,
+      path: `/${doc.category?.slug}/${doc.slug}`,
     }
-  }
-
-  @Get('/:id')
-  @Auth()
-  async getById(@Param() params: MongoIdDto) {
-    const { id } = params
-    const doc = await this.postService.model
-      .findById(id)
-      .populate('category')
-      .populate({
-        path: 'related',
-        select: 'title slug id _id categoryId category',
-      })
-    if (!doc) {
-      throw new CannotFindException()
-    }
-
-    return doc
   }
 
   @Get('/latest')
-  async getLatest(@IpLocation() ip: IpRecord) {
-    const last = await this.postService.model
-      .findOne({})
-      .sort({ created: -1 })
-      .lean({ getters: true, autopopulate: true })
+  async getLatest(
+    @IpLocation() ip: IpRecord,
+    @HasAdminAccess() isAuthenticated: boolean,
+    @Lang() lang?: string,
+    @CurrentReaderId() readerId?: string,
+  ) {
+    const [last] = await this.postService.findRecent(1, {
+      publishedOnly: !isAuthenticated,
+    })
     if (!last) {
-      throw new CannotFindException()
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
     }
+    if (!last.category?.slug)
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
     return this.getByCateAndSlug(
-      {
-        category: (last.category as CategoryModel).slug,
-        slug: last.slug,
-      },
+      { category: last.category.slug, slug: last.slug },
+      {} as any,
       ip,
+      isAuthenticated,
+      lang,
+      readerId,
     )
   }
 
+  @Get('/:id')
+  @BypassCaseTransform(['meta'])
+  async getById(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @HasAdminAccess() isAuthenticated: boolean,
+    @Lang() lang?: string,
+    @CurrentReaderId() readerId?: string,
+  ) {
+    const { id } = params
+    const doc = await this.postService.findById(id)
+    if (!doc) {
+      throw createAppException(AppErrorCode.POST_NOT_FOUND, { id })
+    }
+
+    if (!isAuthenticated && !doc.isPublished) {
+      throw createAppException(AppErrorCode.POST_NOT_FOUND, { id })
+    }
+
+    const [translationResult, entryMaps] = await Promise.all([
+      this.translationService.translateArticle({
+        articleId: String(doc.id),
+        targetLang: lang,
+        allowHidden: true,
+        originalData: {
+          title: doc.title,
+          text: doc.text,
+          summary: doc.summary,
+          tags: doc.tags,
+        },
+      }),
+      this.batchEntryTranslations(lang ?? '', [doc]),
+    ])
+
+    applyArticleTranslationInPlace(
+      doc as Record<string, any>,
+      translationResult,
+    )
+
+    if (lang) {
+      applyTranslationEntriesInPlace(
+        doc as Record<string, any>,
+        entryMaps,
+        CATEGORY_NAME_RULES,
+      )
+    }
+
+    const paywall = await this.applyPaywall(
+      doc as Record<string, any>,
+      !!isAuthenticated,
+      readerId,
+    )
+
+    const { enrichments, ...docData } =
+      await this.enrichmentService.attachEnrichments(doc)
+
+    const skillIds =
+      Array.isArray(doc.meta?.skillIds) && doc.meta.skillIds.length > 0
+        ? (doc.meta.skillIds as string[])
+        : []
+    const skills = await this.snippetService
+      .findSkillBundlesByIds(skillIds, { includePrivate: !!isAuthenticated })
+      .catch(() => [])
+
+    const metaBuilder = new PostMetaBuilder()
+      .view('detail')
+      .enrichments(enrichments as Record<string, EnrichmentEntry>)
+
+    const translationMap = new Map([
+      [
+        String(doc.id),
+        {
+          article: buildArticleTranslationMeta(
+            translationResult,
+            lang,
+          ) as ArticleTranslation,
+        },
+      ],
+    ])
+    metaBuilder.translation(translationMap)
+    if (lang) this.applyTagGlossary(metaBuilder, entryMaps)
+
+    if (skills.length > 0) metaBuilder.skills(skills)
+
+    if (paywall) metaBuilder.paywall(paywall)
+
+    return withMeta(docData, metaBuilder.build())
+  }
+
   @Get('/:category/:slug')
+  @BypassCaseTransform(['meta'])
   async getByCateAndSlug(
-    @Param() params: CategoryAndSlugDto,
+    @Param({ schema: CategoryAndSlugSchema }) params: CategoryAndSlugDto,
+    @Query({ schema: PostDetailQuerySchema }) query: PostDetailQueryDto,
     @IpLocation() { ip }: IpRecord,
+    @HasAdminAccess() isAuthenticated?: boolean,
+    @Lang() lang?: string,
+    @CurrentReaderId() readerId?: string,
   ) {
     const { category, slug } = params
-    const postDocument = await this.postService.getPostBySlug(category, slug)
+    const postDocument = await this.postService.getPostBySlug(
+      category,
+      slug,
+      isAuthenticated,
+    )
     if (!postDocument) {
-      throw new CannotFindException()
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
     }
+
+    if (!isAuthenticated && !postDocument.isPublished) {
+      throw createAppException(AppErrorCode.POST_NOT_FOUND)
+    }
+
     const liked = await this.countingService.getThisRecordIsLiked(
       postDocument.id,
       ip,
     )
 
-    return { ...postDocument.toObject(), liked }
-  }
+    const relatedList = Array.isArray((postDocument as any).related)
+      ? ((postDocument as any).related as any[])
+      : []
+    const relatedIds = relatedList
+      .map((item) => item?.id)
+      .filter((id): id is string => Boolean(id))
 
-  @Post('/')
-  @Auth()
-  @HTTPDecorators.Idempotence()
-  async create(@Body() body: PostModel) {
-    return await this.postService.create({
-      ...body,
-      modified: null,
-      slug: body.slug,
-      related: body.relatedId as any,
-    })
-  }
+    const insightsLang = parseLanguageCode(lang)
+    const [
+      translationResult,
+      relatedTitleMap,
+      entryMaps,
+      hasInsightsInLocale,
+      summaryDoc,
+      ttsMeta,
+    ] = await Promise.all([
+      this.translationService.translateArticle({
+        articleId: postDocument.id,
+        targetLang: lang,
+        allowHidden: Boolean(isAuthenticated),
+        originalData: {
+          title: postDocument.title,
+          text: postDocument.text,
+          summary: postDocument.summary,
+          tags: postDocument.tags,
+        },
+      }),
+      this.translationService.getCachedTitles(relatedIds, lang),
+      this.batchEntryTranslations(lang ?? '', [postDocument]),
+      this.aiInsightsService
+        .hasInsightsInLang(postDocument.id, insightsLang)
+        .catch(() => false),
+      this.aiSummaryService.getSummaryForPublicMeta(
+        postDocument.id,
+        insightsLang,
+      ),
+      this.aiTtsQueryService
+        .getMetaForArticle(
+          postDocument.id,
+          insightsLang,
+          postDocument.modifiedAt,
+        )
+        .catch(() => ({ available: false as const })),
+    ])
 
-  @Put('/:id')
-  @Auth()
-  async update(@Param() params: MongoIdDto, @Body() body: PostModel) {
-    return await this.postService.updateById(params.id, body)
+    applyArticleTranslationInPlace(
+      postDocument as Record<string, any>,
+      translationResult,
+    )
+
+    if (lang) {
+      applyTranslationEntriesInPlace(
+        postDocument as Record<string, any>,
+        entryMaps,
+        CATEGORY_NAME_RULES,
+      )
+    }
+
+    const translatedRelated = relatedTitleMap.size
+      ? relatedList.map((item) => {
+          const refId = item?.id
+          const translatedTitle = refId ? relatedTitleMap.get(refId) : undefined
+          return translatedTitle ? { ...item, title: translatedTitle } : item
+        })
+      : relatedList
+
+    const { related: _related, ...postEntity } = postDocument
+    const paywall = await this.applyPaywall(
+      postEntity as Record<string, any>,
+      !!isAuthenticated,
+      readerId,
+    )
+    const { enrichments, ...postData } =
+      await this.enrichmentService.attachEnrichments(postEntity)
+
+    const skillIds =
+      Array.isArray(postDocument.meta?.skillIds) &&
+      postDocument.meta.skillIds.length > 0
+        ? (postDocument.meta.skillIds as string[])
+        : []
+    const skills = await this.snippetService
+      .findSkillBundlesByIds(skillIds, { includePrivate: !!isAuthenticated })
+      .catch(() => [])
+
+    const metaBuilder = new PostMetaBuilder()
+      .view('detail')
+      .interaction({ isLiked: liked })
+      .related(translatedRelated)
+      .insights({ hasInLocale: hasInsightsInLocale })
+      .tts(paywall?.locked ? { available: false } : ttsMeta)
+      .enrichments(enrichments as Record<string, EnrichmentEntry>)
+
+    if (summaryDoc && !paywall?.locked) {
+      metaBuilder.summary({
+        id: summaryDoc.id,
+        text: summaryDoc.summary,
+        lang: summaryDoc.lang ?? insightsLang,
+        createdAt: summaryDoc.createdAt,
+      })
+    }
+
+    const translationMap = new Map([
+      [
+        String(postDocument.id),
+        {
+          article: buildArticleTranslationMeta(
+            translationResult,
+            lang,
+          ) as ArticleTranslation,
+        },
+      ],
+    ])
+    metaBuilder.translation(translationMap)
+    if (lang) this.applyTagGlossary(metaBuilder, entryMaps)
+
+    if (skills.length > 0) metaBuilder.skills(skills)
+
+    if (paywall) metaBuilder.paywall(paywall)
+
+    return withMeta(postData, metaBuilder.build())
   }
 
   @Patch('/:id')
   @Auth()
-  async patch(@Param() params: MongoIdDto, @Body() body: PartialPostModel) {
-    await this.postService.updateById(params.id, body)
-    return
+  async patch(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: PartialPostSchema }) body: PartialPostDto,
+  ) {
+    await this.postService.updateById(
+      params.id,
+      body as unknown as Partial<PostModel>,
+    )
   }
 
   @Delete('/:id')
   @Auth()
-  async deletePost(@Param() params: MongoIdDto) {
+  async deletePost(@Param({ schema: EntityIdSchema }) params: EntityIdDto) {
     const { id } = params
     await this.postService.deletePost(id)
+  }
 
-    return
+  @Patch('/:id/publish')
+  @Auth()
+  async setPublishStatus(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: SetPostPublishStatusSchema }) body: SetPostPublishStatusDto,
+  ) {
+    await this.postService.updateById(params.id, {
+      isPublished: body.isPublished,
+    })
+    return { success: true }
   }
 }

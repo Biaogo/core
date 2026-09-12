@@ -1,56 +1,49 @@
-import { dump } from 'js-yaml'
-import JSZip from 'jszip'
-import { omit } from 'lodash'
-import { Types } from 'mongoose'
-import type { DatatypeDto } from './markdown.dto'
-import type { MarkdownYAMLProperty } from './markdown.interface'
-
 import {
-  BadRequestException,
   Injectable,
   InternalServerErrorException,
   Logger,
 } from '@nestjs/common'
-import { ReturnModelType } from '@typegoose/typegoose'
+import { omit } from 'es-toolkit/compat'
+import { dump } from 'js-yaml'
+import { escapeHtml } from 'xss'
 
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { CollectionRefTypes } from '~/constants/db.constant'
 import { DatabaseService } from '~/processors/database/database.service'
 import { AssetService } from '~/processors/helper/helper.asset.service'
-import { TextMacroService } from '~/processors/helper/helper.macro.service'
-import { InjectModel } from '~/transformers/model.transformer'
+import { getPublicText } from '~/processors/helper/lexical-truncate.util'
+import { ContentFormat } from '~/shared/types/content-format.type'
 
-import { CategoryModel } from '../category/category.model'
-import { NoteModel } from '../note/note.model'
-import { PageModel } from '../page/page.model'
-import { PostModel } from '../post/post.model'
+import { CategoryService } from '../category/category.service'
+import { NoteService } from '../note/note.service'
+import { type NoteModel } from '../note/note.types'
+import { PageService } from '../page/page.service'
+import { PostService } from '../post/post.service'
+import { type PostModel } from '../post/post.types'
+import type { MarkdownYAMLProperty } from './markdown.interface'
+import type { DatatypeDto } from './markdown.schema'
 import { markdownToHtml } from './markdown.util'
 
 @Injectable()
 export class MarkdownService {
+  private readonly logger = new Logger(MarkdownService.name)
+
   constructor(
     private readonly assetService: AssetService,
-
-    @InjectModel(CategoryModel)
-    private readonly categoryModel: ReturnModelType<typeof CategoryModel>,
-    @InjectModel(PostModel)
-    private readonly postModel: ReturnModelType<typeof PostModel>,
-    @InjectModel(NoteModel)
-    private readonly noteModel: ReturnModelType<typeof NoteModel>,
-    @InjectModel(PageModel)
-    private readonly pageModel: ReturnModelType<typeof PageModel>,
-
+    private readonly categoryService: CategoryService,
+    private readonly postService: PostService,
+    private readonly noteService: NoteService,
+    private readonly pageService: PageService,
     private readonly databaseService: DatabaseService,
-
-    private readonly macroService: TextMacroService,
   ) {}
 
   async insertPostsToDb(data: DatatypeDto[]) {
     let count = 1
-    const categoryNameAndId = (await this.categoryModel.find().lean()).map(
-      (c) => {
-        return { name: c.name, _id: c._id, slug: c.slug }
-      },
-    )
+    const categoryNameAndId = (
+      await this.categoryService.findAllCategory()
+    ).map((c) => {
+      return { name: c.name, id: c.id, slug: c.slug }
+    })
 
     const insertOrCreateCategory = async (name?: string) => {
       if (!name) {
@@ -62,18 +55,12 @@ export class MarkdownService {
       )
 
       if (!hasCategory) {
-        const newCategoryDoc = await this.categoryModel.create({
-          name,
-          slug: name,
-          type: 0,
-        })
+        const newCategoryDoc = await this.categoryService.create(name, name)
         categoryNameAndId.push({
           name: newCategoryDoc.name,
-          _id: newCategoryDoc._id,
+          id: newCategoryDoc.id,
           slug: newCategoryDoc.slug,
         })
-
-        await newCategoryDoc.save()
         return newCategoryDoc
       } else {
         return hasCategory
@@ -81,18 +68,18 @@ export class MarkdownService {
     }
     const genDate = this.genDate
     const models = [] as PostModel[]
-    const defaultCategory = await this.categoryModel.findOne()
+    const defaultCategory = categoryNameAndId[0]
     if (!defaultCategory) {
-      throw new InternalServerErrorException('分类不存在')
+      throw new InternalServerErrorException('Category does not exist')
     }
-    for await (const item of data) {
+    for (const item of data) {
       if (!item.meta) {
         models.push({
-          title: `未命名-${count++}`,
-          slug: Date.now(),
+          title: `Untitled-${count++}`,
+          slug: String(Date.now()),
           text: item.text,
           ...genDate(item),
-          categoryId: new Types.ObjectId(defaultCategory._id),
+          categoryId: defaultCategory.id,
         } as any as PostModel)
       } else {
         const category = await insertOrCreateCategory(
@@ -103,50 +90,55 @@ export class MarkdownService {
           slug: item.meta.slug || item.meta.title,
           text: item.text,
           ...genDate(item),
-          categoryId: category?._id.toHexString() || defaultCategory._id,
+          categoryId: category?.id ?? defaultCategory.id,
+          tags: item.meta.tags || [],
         } as PostModel)
       }
     }
-    return await this.postModel
-      .insertMany(models, { ordered: false })
-      .catch(() => {
-        Logger.log('一篇文章导入失败', MarkdownService.name)
-      })
+    return await Promise.all(
+      models.map((model) =>
+        this.postService.create({
+          ...model,
+          contentFormat: model.contentFormat ?? ContentFormat.Markdown,
+        } as any),
+      ),
+    ).catch(() => {
+      this.logger.warn('Failed to import one post')
+    })
   }
 
   async insertNotesToDb(data: DatatypeDto[]) {
     const models = [] as NoteModel[]
-    for await (const item of data) {
-      if (!item.meta) {
-        models.push({
-          title: '未命名记录',
-          text: item.text,
-          ...this.genDate(item),
-        } as NoteModel)
-      } else {
-        models.push({
-          title: item.meta.title,
-          text: item.text,
-          ...this.genDate(item),
-        } as NoteModel)
-      }
+    for (const item of data) {
+      models.push({
+        title: item.meta?.title ?? 'Untitled note',
+        text: item.text,
+        ...this.genDate(item),
+      } as NoteModel)
     }
 
-    return await this.noteModel.create(models)
+    return await Promise.all(
+      models.map((model) =>
+        this.noteService.create({
+          ...model,
+          contentFormat: model.contentFormat ?? ContentFormat.Markdown,
+        } as any),
+      ),
+    )
   }
 
   private readonly genDate = (item: DatatypeDto) => {
     const { meta } = item
     if (!meta) {
       return {
-        created: new Date(),
-        modified: new Date(),
+        createdAt: new Date(),
+        modifiedAt: new Date(),
       }
     }
     const { date, updated } = meta
     return {
-      created: date ? new Date(date) : new Date(),
-      modified: updated
+      createdAt: date ? new Date(date) : new Date(),
+      modifiedAt: updated
         ? new Date(updated)
         : date
           ? new Date(date)
@@ -155,10 +147,15 @@ export class MarkdownService {
   }
 
   async extractAllArticle() {
+    const [posts, notes, pages] = await Promise.all([
+      this.postService.findRecent(100),
+      this.noteService.findRecent(100),
+      this.pageService.findAll(),
+    ])
     return {
-      posts: await this.postModel.find().populate('category').lean(),
-      notes: await this.noteModel.find().lean(),
-      pages: await this.pageModel.find().lean(),
+      posts,
+      notes,
+      pages,
     }
   }
 
@@ -169,15 +166,15 @@ export class MarkdownService {
     documents: MarkdownYAMLProperty[]
     options: { slug?: boolean }
   }) {
+    const JSZip = (await import('jszip')).default
     const zip = new JSZip()
 
     for (const document of documents) {
-      zip.file(
-        (options.slug ? document.meta.slug : document.meta.title)
-          .concat('.md')
-          .replaceAll('/', '-'),
-        document.text,
+      // Notes set meta.slug to nid (a number) — coerce so .concat works.
+      const name = String(
+        options.slug ? document.meta.slug : document.meta.title,
       )
+      zip.file(name.concat('.md').replaceAll('/', '-'), document.text)
     }
     return zip
   }
@@ -188,20 +185,20 @@ export class MarkdownService {
     showHeader?: boolean,
   ) {
     const {
-      meta: { created, modified, title },
+      meta: { createdAt, modifiedAt, title },
       text,
     } = property
     if (!includeYAMLHeader) {
       return `${showHeader ? `# ${title}\n\n` : ''}${text.trim()}`
     }
     const header = {
-      date: created,
-      updated: modified,
+      date: createdAt,
+      updated: modifiedAt,
       title,
-      ...omit(property.meta, ['created', 'modified', 'title']),
+      ...omit(property.meta, ['createdAt', 'modifiedAt', 'title']),
     }
     const toYaml = dump(header, { skipInvalid: true })
-    const res = `
+    return `
 ---
 ${toYaml.trim()}
 ---
@@ -209,35 +206,32 @@ ${toYaml.trim()}
 ${showHeader ? `# ${title}\n\n` : ''}
 ${text.trim()}
 `.trim()
-
-    return res
   }
 
   /**
-   * 根据文章 Id 渲染一篇文章
+   * Render a single article by its ID.
    * @param id
    * @returns
    */
-  async renderArticle(id: string) {
+  async renderArticle(id: string, options: { asOwner?: boolean } = {}) {
     const result = await this.databaseService.findGlobalById(id)
 
     if (!result || result.type === CollectionRefTypes.Recently)
-      throw new BadRequestException('文档不存在')
+      throw createAppException(AppErrorCode.DOCUMENT_NOT_FOUND, { id })
+
+    const text = options.asOwner
+      ? result.document.text
+      : getPublicText(result.document)
 
     return {
-      html: this.renderMarkdownContent(
-        await this.macroService.replaceTextMacro(
-          result.document.text,
-          result.document,
-        ),
-      ),
+      html: this.renderMarkdownContent(text),
       ...result,
       document: result.document,
     }
   }
 
   /**
-   * 渲染 Markdown 文本输出 html
+   * Render Markdown text to HTML.
    * @param text
    * @returns
    */
@@ -259,15 +253,12 @@ ${text.trim()}
       { encoding: 'utf-8' },
     )
     return {
-      body: [`<article><h1>${title}</h1>${html}</article>`],
+      body: [`<article><h1>${escapeHtml(title)}</h1>${html}</article>`],
       extraScripts: [
         '<script src="https://lf26-cdn-tos.bytecdntp.com/cdn/expire-1-M/mermaid/8.9.0/mermaid.min.js"></script>',
         '<script src="https://lf26-cdn-tos.bytecdntp.com/cdn/expire-1-M/prism/1.23.0/components/prism-core.min.js"></script>',
         '<script src="https://lf26-cdn-tos.bytecdntp.com/cdn/expire-1-M/prism/1.23.0/plugins/autoloader/prism-autoloader.min.js"></script>',
         '<script src="https://lf3-cdn-tos.bytecdntp.com/cdn/expire-1-M/prism/1.23.0/plugins/line-numbers/prism-line-numbers.min.js"></script>',
-        // '<script src="https://cdn.jsdelivr.net/npm/prismjs@1.24.1/plugins/show-language/prism-show-language.min.js" defer></script>',
-        // '<script src="https://cdn.jsdelivr.net/npm/prismjs@1.24.1/plugins/normalize-whitespace/prism-normalize-whitespace.min.js" defer></script>',
-        // '<script src="https://cdn.jsdelivr.net/npm/prismjs@1.24.1/plugins/copy-to-clipboard/prism-copy-to-clipboard.min.js" defer></script>',
         '<script src="https://lf6-cdn-tos.bytecdntp.com/cdn/expire-1-M/KaTeX/0.15.2/katex.min.js" async defer></script>',
       ],
       script: [
@@ -292,8 +283,4 @@ ${text.trim()}
       encoding: 'utf8',
     }) as Promise<string>
   }
-
-  // getMarkdownRenderTheme() {
-  //   return ['newsprint', 'github', 'han', 'gothic'] as const
-  // }
 }

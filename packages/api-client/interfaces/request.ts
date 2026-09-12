@@ -1,6 +1,10 @@
+import type { ResponseMeta } from '~/models/base'
+
 import type { RequestOptions } from './instance'
 
-type NoStringIndex<T> = { [K in keyof T as string extends K ? never : K]: T[K] }
+type NoStringIndex<T> = {
+  [K in keyof T as string extends K ? never : K]: T[K]
+}
 
 export type Method = 'get' | 'delete' | 'post' | 'put' | 'patch'
 
@@ -43,6 +47,21 @@ export type RequestProxyResult<
       : Omit<ResponseWrapper, 'data'> & { data: T },
 > = Promise<ResponseProxyExtraRaw<T, R, ResponseWrapper>>
 
+/**
+ * A request result whose protocol owns a response-meta shape distinct from
+ * the legacy content API metadata contract.
+ */
+export type RequestProxyResultWithMeta<
+  T,
+  ResponseWrapper,
+  Meta,
+  R = ResponseWrapper extends unknown
+    ? { data: T; [key: string]: any }
+    : ResponseWrapper extends { data: T }
+      ? ResponseWrapper
+      : Omit<ResponseWrapper, 'data'> & { data: T },
+> = Promise<ResponseProxyExtraRaw<T, R, ResponseWrapper, Meta>>
+
 type CamelToSnake<T extends string, P extends string = ''> = string extends T
   ? string
   : T extends `${infer C0}${infer R}`
@@ -56,7 +75,7 @@ type CamelKeysToSnake<T> = {
   [K in keyof T as CamelToSnake<Extract<K, string>>]: T[K]
 }
 
-type ResponseWrapperType<Response, RawData, T> = {
+type ResponseWrapperType<Response, RawData, T, Meta = ResponseMeta> = {
   $raw: Response extends { data: infer T }
     ? Response
     : Response extends unknown
@@ -72,14 +91,17 @@ type ResponseWrapperType<Response, RawData, T> = {
   }
 
   $serialized: T
+
+  $meta?: Meta
 }
 
 export type ResponseProxyExtraRaw<
   T,
   RawData = unknown,
   Response = unknown,
+  Meta = ResponseMeta,
 > = T extends object
-  ? T & ResponseWrapperType<Response, RawData, T>
+  ? T & ResponseWrapperType<Response, RawData, T, Meta>
   : T extends unknown
-    ? T & ResponseWrapperType<Response, RawData, T>
+    ? T & ResponseWrapperType<Response, RawData, T, Meta>
     : unknown

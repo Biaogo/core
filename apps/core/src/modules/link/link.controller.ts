@@ -1,75 +1,59 @@
-import type mongoose from 'mongoose'
-
-import {
-  Body,
-  ForbiddenException,
-  Get,
-  HttpCode,
-  Param,
-  Patch,
-  Post,
-  Query,
-} from '@nestjs/common'
+import { Body, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common'
 
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import { HTTPDecorators, Paginator } from '~/common/decorators/http.decorator'
-import { IsAuthenticated } from '~/common/decorators/role.decorator'
-import { MongoIdDto } from '~/shared/dto/id.dto'
-import { PagerDto } from '~/shared/dto/pager.dto'
-import {
-  BaseCrudFactory,
-  BaseCrudModuleType,
-} from '~/transformers/crud-factor.transformer'
+import { HTTPDecorators } from '~/common/decorators/http.decorator'
+import { HasAdminAccess } from '~/common/decorators/role.decorator'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { OK_DATA, withMeta } from '~/common/response/envelope.types'
+import { MetaObjectBuilder } from '~/common/response/meta-builder'
+import { type EntityIdDto, EntityIdSchema } from '~/shared/dto/id.dto'
+import { BasePgCrudFactory } from '~/transformers/crud-factor.pg.transformer'
 import { scheduleManager } from '~/utils/schedule.util'
 
-import { AuditReasonDto, LinkDto } from './link.dto'
-import { LinkModel, LinkState } from './link.model'
+import { LinkRepository } from './link.repository'
+import {
+  type AuditReasonDto,
+  AuditReasonSchema,
+  type LinkDto,
+  type LinkPagerDto,
+  LinkPagerSchema,
+  LinkWithAuthorSchema,
+} from './link.schema'
 import { LinkService } from './link.service'
+import { LinkState } from './link.types'
 
 const paths = ['links', 'friends']
 
 @ApiController(paths)
-export class LinkControllerCrud extends BaseCrudFactory({
-  model: LinkModel,
+export class LinkControllerCrud extends BasePgCrudFactory({
+  repository: LinkRepository,
 }) {
   @Get('/')
-  @Paginator
   async gets(
-    this: BaseCrudModuleType<LinkModel>,
-    @Query() pager: PagerDto,
-    @IsAuthenticated() isAuthenticated: boolean,
+    @Query({ schema: LinkPagerSchema }) pager: LinkPagerDto,
+    @HasAdminAccess() hasAdminAccess: boolean,
   ) {
-    const { size, page, state } = pager
-
-    return await this._model.paginate(state !== undefined ? { state } : {}, {
-      limit: size,
-      page,
-      sort: { created: -1 },
-      select: isAuthenticated ? '' : '-email',
+    const { size = 10, page = 1, state } = pager
+    const result = await this.repository.list(page, size, {
+      state: state !== undefined ? (Number(state) as LinkState) : undefined,
     })
+    if (!hasAdminAccess) {
+      result.data = result.data.map((row) => ({ ...row, email: null }))
+    }
+    return withMeta(
+      result.data,
+      new MetaObjectBuilder().pagination(result.pagination).build(),
+    )
   }
 
   @Get('/all')
-  async getAll(
-    this: BaseCrudModuleType<LinkModel>,
-    @IsAuthenticated() isAuthenticated: boolean,
-  ) {
-    // 过滤未通过审核和被拒绝的
-    const condition: mongoose.FilterQuery<LinkModel> = {
-      $nor: [
-        { state: LinkState.Audit },
-        {
-          state: LinkState.Reject,
-        },
-      ],
-    }
-
-    return await this._model
-      .find(condition)
-      .sort({ created: -1 })
-      .select(isAuthenticated ? '' : '-email')
-      .lean()
+  async getAll(@HasAdminAccess() hasAdminAccess: boolean) {
+    const rows = await this.repository.findAvailable()
+    const data = hasAdminAccess
+      ? rows
+      : rows.map((row) => ({ ...row, email: null }))
+    return data
   }
 }
 
@@ -79,64 +63,67 @@ export class LinkController {
 
   @Get('/audit')
   async canApplyLink() {
-    return {
-      can: await this.linkService.canApplyLink(),
-    }
+    const can = await this.linkService.canApplyLink()
+    return { can }
   }
 
   @Get('/state')
   @Auth()
-  async getLinkCount() {
-    return await this.linkService.getCount()
+  getLinkCount() {
+    return this.linkService.getCount()
   }
 
-  /** 申请友链 */
   @Post('/audit')
   @HTTPDecorators.Idempotence({
     expired: 20,
-    errorMessage: '哦吼，你已经提交过这个友链了',
+    errorMessage: 'Oh, you have already submitted this friend link',
   })
-  async applyForLink(@Body() body: LinkDto) {
+  async applyForLink(@Body({ schema: LinkWithAuthorSchema }) body: LinkDto) {
     if (!(await this.linkService.canApplyLink())) {
-      throw new ForbiddenException('主人目前不允许申请友链了！')
+      throw createAppException(AppErrorCode.LINK_APPLY_DISABLED)
     }
-
-    await this.linkService.applyForLink(body)
+    await this.linkService.applyForLink(body as any)
     scheduleManager.schedule(async () => {
-      await this.linkService.sendToMaster(body.author, body)
+      await this.linkService.sendToOwner(body.author, body as any)
     })
-
-    return
+    return OK_DATA
   }
 
   @Patch('/audit/:id')
   @Auth()
   async approveLink(@Param('id') id: string) {
-    const doc = await this.linkService.approveLink(id)
-
+    const { link, convertedAvatar } = await this.linkService.approveLink(id)
     scheduleManager.schedule(async () => {
-      if (doc.email) {
-        await this.linkService.sendToCandidate(doc)
+      if (link.email) {
+        await this.linkService.sendToCandidate(link)
       }
     })
-    return
+    return { link, convertedAvatar }
   }
 
   @Post('/audit/reason/:id')
   @Auth()
-  @HttpCode(201)
+  @HttpCode(200)
   async sendReasonByEmail(
-    @Param() params: MongoIdDto,
-    @Body() body: AuditReasonDto,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: AuditReasonSchema }) body: AuditReasonDto,
   ) {
     const { id } = params
     const { reason, state } = body
     await this.linkService.sendAuditResultByEmail(id, reason, state)
+    return OK_DATA
   }
 
   @Auth()
   @Get('/health')
-  async checkHealth() {
+  checkHealth() {
     return this.linkService.checkLinkHealth()
+  }
+
+  @Post('/avatar/migrate')
+  @HttpCode(200)
+  @Auth()
+  migrateExternalAvatars() {
+    return this.linkService.migrateExternalAvatarsForPassedLinks()
   }
 }

@@ -1,59 +1,70 @@
-import { omit, pick, uniqBy } from 'lodash'
-import { ObjectId } from 'mongodb'
 import type { OnModuleDestroy, OnModuleInit } from '@nestjs/common'
-import type { Document } from 'mongoose'
-import type { Socket } from 'socket.io'
-import type { NoteModel } from '../note/note.model'
-import type { PageModel } from '../page/page.model'
-import type { PostModel } from '../post/post.model'
-import type { RecentlyModel } from '../recently/recently.model'
-import type {
-  ActivityLikePayload,
-  ActivityLikeSupportType,
-  ActivityPresence,
-} from './activity.interface'
-import type { UpdatePresenceDto } from './dtos/presence.dto'
-
-import {
-  BadRequestException,
-  forwardRef,
-  Inject,
-  Injectable,
-  Logger,
-} from '@nestjs/common'
+import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common'
+import { omit, pick, uniqBy } from 'es-toolkit/compat'
 
 import { RequestContext } from '~/common/contexts/request.context'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { ArticleTypeEnum } from '~/constants/article.constant'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
-import {
-  NOTE_COLLECTION_NAME,
-  POST_COLLECTION_NAME,
-  RECENTLY_COLLECTION_NAME,
-} from '~/constants/db.constant'
+import { POST_SERVICE_TOKEN } from '~/constants/injection.constant'
 import { DatabaseService } from '~/processors/database/database.service'
+import type { SocketLike } from '~/processors/gateway/gateway.service'
 import { GatewayService } from '~/processors/gateway/gateway.service'
 import { WebEventsGateway } from '~/processors/gateway/web/events.gateway'
 import { CountingService } from '~/processors/helper/helper.counting.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
-import { InjectModel } from '~/transformers/model.transformer'
-import { transformDataToPaginate } from '~/transformers/paginate.transformer'
+import {
+  getPublicContent,
+  getPublicText,
+} from '~/processors/helper/lexical-truncate.util'
 import { checkRefModelCollectionType } from '~/utils/biz.util'
 import { camelcaseKeys } from '~/utils/tool.util'
 
-import { CommentState } from '../comment/comment.model'
+import { CommentState } from '../comment/comment.enum'
 import { CommentService } from '../comment/comment.service'
 import { ConfigsService } from '../configs/configs.service'
 import { NoteService } from '../note/note.service'
-import { PostService } from '../post/post.service'
-import { ReaderModel } from '../reader/reader.model'
+import type { NoteModel } from '../note/note.types'
+import type { PostService } from '../post/post.service'
+import type { PostModel } from '../post/post.types'
 import { ReaderService } from '../reader/reader.service'
+import { type ReaderModel } from '../reader/reader.types'
 import { Activity } from './activity.constant'
-import { ActivityModel } from './activity.model'
+import type {
+  ActivityLikePayload,
+  ActivityPresence,
+} from './activity.interface'
+import { ActivityRepository } from './activity.repository'
+import type { UpdatePresenceDto } from './activity.schema'
+import type { ActivityRow } from './activity.types'
 import {
   extractArticleIdFromRoomName,
   isValidRoomName,
   parseRoomName,
+  resolvePresenceReaderId,
+  toPublicPresenceReader,
 } from './activity.util'
+
+interface ActivityPayloadWithRef {
+  id?: string
+  type?: string
+  readerId?: string
+  roomName?: string
+}
+
+function toObjectPayload(
+  payload: ActivityRow['payload'],
+): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== 'object') return undefined
+  return payload as Record<string, unknown>
+}
+
+type ActivityWithRef = ActivityRow & {
+  created: Date
+  ref?: PostModel | NoteModel
+  reader?: ReaderModel
+  refId?: string
+}
 
 declare module '~/types/socket-meta' {
   interface SocketMetadata {
@@ -69,8 +80,7 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
 
     private readonly eventService: EventManagerService,
 
-    @InjectModel(ActivityModel)
-    private readonly activityModel: MongooseModel<ActivityModel>,
+    private readonly activityRepository: ActivityRepository,
 
     private readonly commentService: CommentService,
     private readonly databaseService: DatabaseService,
@@ -79,7 +89,7 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
     private readonly gatewayService: GatewayService,
     private readonly configsService: ConfigsService,
 
-    @Inject(forwardRef(() => PostService))
+    @Inject(POST_SERVICE_TOKEN)
     private readonly postService: PostService,
     @Inject(forwardRef(() => NoteService))
     private readonly noteService: NoteService,
@@ -95,7 +105,12 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleInit() {
-    const handlePresencePersistToDb = async (socket: Socket) => {
+    // handleDisconnect fires onDisconnected plus onLeaveRoom per room for the
+    // same connection; without this mark the same read-duration would be
+    // inserted once per hook invocation. The check-and-set is synchronous
+    // (no await in between) so concurrent hook runs cannot both pass it.
+    const persistedOperationTime = new Map<string, number>()
+    const handlePresencePersistToDb = async (socket: SocketLike) => {
       const meta = await this.gatewayService.getSocketMetadata(socket)
 
       const { presence, roomJoinedAtMap } = meta
@@ -117,7 +132,14 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
         if (duration < 10_000 || (position === 0 && duration < 60_000)) {
           return
         }
-        this.activityModel.create({
+        if (persistedOperationTime.get(socket.id) === operationTime) return
+        persistedOperationTime.set(socket.id, operationTime)
+        setTimeout(() => {
+          if (persistedOperationTime.get(socket.id) === operationTime) {
+            persistedOperationTime.delete(socket.id)
+          }
+        }, 60_000).unref?.()
+        this.activityRepository.create({
           type: Activity.ReadDuration,
           payload: {
             connectedAt,
@@ -154,145 +176,81 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
     this.cleanupFnList = q
   }
 
-  get model() {
-    return this.activityModel
-  }
-
   async getLikeActivities(page = 1, size = 10) {
-    const activities = await this.model.paginate(
-      {
-        type: Activity.Like,
-      },
-      {
-        page,
-        limit: size,
-        sort: {
-          created: -1,
-        },
-      },
+    const activities = await this.activityRepository.list(
+      page,
+      size,
+      Activity.Like,
     )
 
-    const transformedPager = transformDataToPaginate(activities)
-    const typedIdsMap = transformedPager.data.reduce(
-      (acc, item) => {
-        const { type, id } = item.payload as ActivityLikePayload
-
-        switch (type.toLowerCase()) {
-          case 'note': {
-            acc.note.push(id)
-            break
-          }
-          case 'post': {
-            acc.post.push(id)
-
-            break
-          }
-        }
-        return acc
-      },
-      {
-        post: [],
-        note: [],
-      } as Record<ActivityLikeSupportType, string[]>,
-    )
-
-    const readerIds = [] as string[]
-    for (const item of activities.docs) {
-      const readerId = item.payload.readerId
-      if (readerId) {
-        readerIds.push(readerId)
+    const refIds: string[] = []
+    const readerIds: string[] = []
+    for (const item of activities.data) {
+      const payload = toObjectPayload(item.payload) as
+        Partial<ActivityLikePayload> | undefined
+      if (!payload) continue
+      const { type, id, readerId } = payload
+      if (typeof type === 'string' && typeof id === 'string') {
+        const lower = type.toLowerCase()
+        if (lower === 'note' || lower === 'post') refIds.push(id)
       }
+      if (typeof readerId === 'string') readerIds.push(readerId)
     }
 
-    const readers = await this.readerService.findReaderInIds(readerIds)
+    const [readers, collections] = await Promise.all([
+      this.readerService.findReaderInIds(readerIds),
+      this.databaseService.findGlobalByIds(refIds),
+    ])
 
-    const readerMap = new Map<string, ReaderModel>()
-    for (const reader of readers) {
-      readerMap.set(reader._id.toHexString(), reader)
-    }
-
-    const type2Collection = {
-      note: this.databaseService.db.collection<NoteModel>(NOTE_COLLECTION_NAME),
-      post: this.databaseService.db.collection<PostModel>(POST_COLLECTION_NAME),
-    }
-
+    const readerMap = new Map(readers.map((reader) => [reader.id, reader]))
     const refModelData = new Map<string, any>()
-    for (const [type, ids] of Object.entries(typedIdsMap)) {
-      const collection = type2Collection[type as ActivityLikeSupportType]
-      const docs = await collection
-        .find(
-          {
-            _id: {
-              $in: ids.map((id) => new ObjectId(id)),
-            },
-          },
-          {
-            projection: {
-              text: 0,
-            },
-          },
-        )
-        .toArray()
-
-      for (const doc of docs) {
-        refModelData.set(doc._id.toHexString(), doc)
-      }
+    for (const doc of [
+      ...collections.posts,
+      ...collections.notes,
+      ...collections.pages,
+      ...collections.recentlies,
+    ]) {
+      refModelData.set(doc.id, doc)
     }
 
-    const docsWithRefModel = activities.docs.map((ac) => {
-      const nextAc = ac.toJSON()
-      const refModel = refModelData.get(ac.payload.id)
+    const docsWithRefModel = activities.data.map((ac) => {
+      const nextAc = { ...ac } as ActivityWithRef
+      const payload = toObjectPayload(ac.payload) as
+        ActivityPayloadWithRef | undefined
+      if (!payload) return nextAc
 
-      refModel && Reflect.set(nextAc, 'ref', refModel)
-      const readerId = ac.payload.readerId
-      if (readerId) {
-        const reader = readerMap.get(readerId)
-        if (reader) {
-          Object.assign(nextAc, {
-            reader,
-          })
-        }
+      const refModel = payload.id ? refModelData.get(payload.id) : undefined
+      if (refModel) nextAc.ref = refModel
+
+      if (payload.readerId) {
+        const reader = readerMap.get(payload.readerId)
+        if (reader) nextAc.reader = reader
       }
 
       return nextAc
-    }) as any as (ActivityModel & {
-      payload: any
-      ref: PostModel | NoteModel
-    })[]
+    })
 
     return {
-      ...transformedPager,
+      ...activities,
       data: docsWithRefModel,
     }
   }
 
   async getReadDurationActivities(page = 1, size = 10) {
-    const activities = await this.model.paginate(
-      {
-        type: Activity.ReadDuration,
-      },
-      {
-        page,
-        limit: size,
-        sort: {
-          created: -1,
-        },
-      },
+    const data = await this.activityRepository.list(
+      page,
+      size,
+      Activity.ReadDuration,
     )
-    const data = transformDataToPaginate(activities)
 
-    const articleIds = [] as string[]
-    for (let i = 0; i < data.data.length; i++) {
-      const item = data.data[i]
-      const roomName = item.payload.roomName
-      if (!roomName) continue
-      const refId = extractArticleIdFromRoomName(roomName)
+    const articleIds: string[] = []
+    for (const item of data.data) {
+      const payload = toObjectPayload(item.payload) as
+        ActivityPayloadWithRef | undefined
+      if (!payload || typeof payload.roomName !== 'string') continue
+      const refId = extractArticleIdFromRoomName(payload.roomName)
       articleIds.push(refId)
-
-      // Explicitly type the document conversion
-      const document = data.data[i] as Document & ActivityModel
-      data.data[i] = document.toObject()
-      ;(data.data[i] as any).refId = refId
+      ;(item as ActivityWithRef).refId = refId
     }
 
     const documentMap = await this.databaseService.findGlobalByIds(articleIds)
@@ -303,37 +261,31 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
   }
 
   async likeAndEmit(type: 'post' | 'note', id: string, ip: string) {
-    const readerId = RequestContext.currentRequest()?.readerId
+    const readerId = RequestContext.currentReaderId()
 
     let reader: ReaderModel | null = null
     if (readerId) {
-      reader = await this.readerService
-        .findReaderInIds([readerId])
-        .then((res) => res[0])
+      const readers = await this.readerService.findReaderInIds([readerId])
+      reader = readers[0] ?? null
     }
 
-    try {
-      const mapping = {
-        post: ArticleTypeEnum.Post,
-        note: ArticleTypeEnum.Note,
-      }
-
-      // TODO 改成 reader 维度
-      const res = await this.countingService.updateLikeCountWithIp(
-        mapping[type],
-        id,
-        ip,
-      )
-      if (!res) {
-        throw new BadRequestException('你已经支持过啦！')
-      }
-    } catch (error: any) {
-      throw new BadRequestException(error)
+    const mapping = {
+      post: ArticleTypeEnum.Post,
+      note: ArticleTypeEnum.Note,
     }
 
-    const refModel = await this.databaseService
-      .findGlobalById(id)
-      .then((res) => res?.document)
+    // TODO switch to a reader-level dimension
+    const res = await this.countingService.updateLikeCountWithIp(
+      mapping[type],
+      id,
+      ip,
+    )
+    if (!res) {
+      throw createAppException(AppErrorCode.ALREADY_SUPPORTED)
+    }
+
+    const globalResult = await this.databaseService.findGlobalById(id)
+    const refModel = globalResult?.document
     this.eventService.emit(
       BusinessEvents.ACTIVITY_LIKE,
       {
@@ -342,13 +294,12 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
         reader,
         ref: pick(refModel, [
           'id',
-          '_id',
           'title',
           'nid',
           'slug',
           'category',
           'categoryId',
-          'created',
+          'createdAt',
         ]),
       },
       {
@@ -356,15 +307,14 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
       },
     )
 
-    await this.activityModel.create({
+    await this.activityRepository.create({
       type: Activity.Like,
-      created: new Date(),
       payload: {
         ip,
         type,
         id,
         readerId: reader ? readerId : undefined,
-      } as ActivityLikePayload,
+      },
     })
   }
 
@@ -372,61 +322,84 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
     const roomName = data.roomName
 
     if (!isValidRoomName(roomName)) {
-      throw new BadRequestException('invalid room_name')
+      throw createAppException(AppErrorCode.INVALID_ROOM_NAME)
     }
-    const roomSockets = await this.webGateway.getSocketsOfRoom(roomName)
 
-    // TODO 或许应该找到所有的同一个用户的 socket 最早的一个连接时间
-    const socket = roomSockets.find(
-      (socket) =>
-        // (await this.gatewayService.getSocketMetadata(socket))?.sessionId ===
-        // data.identity,
-        socket.id === data.sid,
+    data.identity = data.identity.toLowerCase()
+
+    const roomSockets = await this.webGateway.getSocketsOfRoom(roomName)
+    const roomSocketMetas = await this.gatewayService.getSocketMetadataMany(
+      roomSockets.map((socket) => socket.id),
     )
-    if (!socket) {
+
+    // Clients never learn their server-generated connection id, so `sid` is
+    // matched against the session id they supplied at handshake as well.
+    const index = roomSockets.findIndex(
+      (socket, i) =>
+        socket.id === data.sid || roomSocketMetas[i]?.sessionId === data.sid,
+    )
+    if (index === -1) {
       this.logger.debug(
         `socket not found, room_name: ${roomName} identity: ${data.identity}`,
       )
       return
     }
 
+    const socket = roomSockets[index]
+    const socketMeta = roomSocketMetas[index]
+
+    const resolvedReaderId = resolvePresenceReaderId(
+      RequestContext.currentReaderId(),
+      socketMeta?.readerId,
+    )
+
     const presenceData: ActivityPresence = {
       ...data,
 
       operationTime: data.ts,
       updatedAt: Date.now(),
-      connectedAt: +new Date(socket.handshake.time),
-      readerId: data.readerId,
+      connectedAt: socketMeta?.connectedAt ?? Date.now(),
+      readerId: resolvedReaderId,
+      image: data.image,
       ip,
     }
 
-    Reflect.deleteProperty(presenceData, 'ts')
-    const serializedPresenceData = omit(presenceData, 'ip')
-    if (data.readerId) {
-      const reader = await this.readerService.findReaderInIds([data.readerId])
+    delete (presenceData as any).ts
+    const serializedPresenceData = omit(presenceData, 'ip') as any
+    if (resolvedReaderId) {
+      const reader = await this.readerService.findReaderInIds([
+        resolvedReaderId,
+      ])
       if (reader.length) {
+        const publicReader = toPublicPresenceReader(reader[0])
         Object.assign(serializedPresenceData, {
-          reader: camelcaseKeys({
-            ...reader[0],
-            _id: undefined,
-            id: reader[0]._id.toHexString(),
-          }),
+          reader: camelcaseKeys(publicReader),
         })
+        if (!serializedPresenceData.image && publicReader.image) {
+          serializedPresenceData.image = publicReader.image
+          presenceData.image = publicReader.image
+        }
       }
     }
 
     const roomJoinedAtMap =
       await this.webGateway.getSocketRoomJoinedAtMap(socket)
 
-    Reflect.set(serializedPresenceData, 'joinedAt', roomJoinedAtMap[roomName])
+    serializedPresenceData.joinedAt = roomJoinedAtMap[roomName]
 
-    this.webGateway.broadcast(
-      BusinessEvents.ACTIVITY_UPDATE_PRESENCE,
-      serializedPresenceData,
-      {
-        rooms: [roomName],
-      },
-    )
+    try {
+      this.webGateway.broadcast(
+        BusinessEvents.ACTIVITY_UPDATE_PRESENCE,
+        serializedPresenceData,
+        {
+          rooms: [roomName],
+        },
+      )
+    } catch (err) {
+      this.logger.warn(
+        `presence broadcast failed for room ${roomName}: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
 
     await this.gatewayService.setSocketMetadata(socket, {
       presence: presenceData,
@@ -441,301 +414,171 @@ export class ActivityService implements OnModuleInit, OnModuleDestroy {
       roomSocket.map((socket) => this.gatewayService.getSocketMetadata(socket)),
     )
 
-    return uniqBy(
-      socketMeta
-        .filter((x) => x?.presence)
-        .map((x) => {
-          // eslint-disable-next-line array-callback-return
-          if (!x.presence) return
+    const presences = socketMeta
+      .filter((x) => x?.presence)
+      .map((x) => ({
+        ...x.presence!,
+        joinedAt: x.roomJoinedAtMap?.[roomName],
+      }))
+      .sort((a, b) => a.updatedAt - b.updatedAt)
 
-          return {
-            ...x.presence,
-            joinedAt: x.roomJoinedAtMap?.[roomName],
-          }
-        })
-        .sort((a, b) => {
-          if (a && b) return a.updatedAt - b.updatedAt
-          return 1
-        }) as ActivityPresence[],
-      (x) => x.identity,
-    )
+    return uniqBy(presences, (x) => x.identity)
   }
 
   async deleteActivityByType(type: Activity, beforeDate: Date) {
-    return this.model.deleteMany({
+    const deletedCount = await this.activityRepository.deleteByTypeBefore(
       type,
-      created: {
-        $lt: beforeDate,
-      },
-    })
+      beforeDate,
+    )
+    return { deletedCount }
   }
 
   async deleteAll() {
-    return this.model.deleteMany({})
+    const deletedCount = await this.activityRepository.deleteAll()
+    return { deletedCount }
   }
 
   async getAllRoomNames() {
     const roomMap = await this.webGateway.getAllRooms()
     const rooms = Object.keys(roomMap)
-    return {
-      rooms,
-      roomCount: rooms.reduce((acc, roomName) => {
-        return {
-          ...acc,
-          [roomName]: roomMap[roomName].length,
-        }
-      }, {}) as any as Record<string, number>,
-    }
+    const roomCount = Object.fromEntries(
+      rooms.map((name) => [name, roomMap[name].length]),
+    ) as Record<string, number>
+    return { rooms, roomCount }
   }
 
   async getRefsFromRoomNames(roomNames: string[]) {
-    const articleIds = [] as string[]
-    for (const roomName of roomNames) {
-      const parsed = parseRoomName(roomName)
-      if (!parsed) continue
-      switch (parsed.type) {
-        case 'article': {
-          const { refId } = parsed
-
-          articleIds.push(refId)
-          break
-        }
-      }
-    }
+    const articleIds = roomNames
+      .map((roomName) => parseRoomName(roomName))
+      .filter((parsed) => parsed?.type === 'article')
+      .map((parsed) => parsed!.refId)
 
     const objects = await this.databaseService.findGlobalByIds(articleIds)
-
     return { objects }
   }
 
-  async getDateRangeOfReadings(startAt?: Date, endAt?: Date) {
+  async getDateRangeOfReadings(startAt?: Date, endAt?: Date, limit = 50) {
     startAt = startAt ?? new Date('2020-01-01')
     endAt = endAt ?? new Date()
 
-    const activities = await this.activityModel
-      .find({
-        created: {
-          $gte: startAt,
-          $lte: endAt,
-        },
-        type: Activity.ReadDuration,
-      })
-      .lean({
-        getters: true,
-      })
+    const activities = await this.activityRepository.findByTypeInRange(
+      Activity.ReadDuration,
+      startAt,
+      endAt,
+    )
 
-    const refIds = new Set<string>()
+    const countMap = new Map<string, number>()
     for (const item of activities) {
-      const parsed = item.payload
-      const refId = extractArticleIdFromRoomName(parsed.roomName)
+      const payload = toObjectPayload(item.payload) as
+        ActivityPayloadWithRef | undefined
+      if (!payload || typeof payload.roomName !== 'string') continue
+      const refId = extractArticleIdFromRoomName(payload.roomName)
       if (!refId) continue
-      refIds.add(refId)
+      countMap.set(refId, (countMap.get(refId) || 0) + 1)
     }
 
-    const activityCountingMap = activities.reduce(
-      (acc, item) => {
-        const refId = extractArticleIdFromRoomName(item.payload.roomName)
-        if (!refId) return acc
-        if (!acc[refId]) {
-          acc[refId] = 0
-        }
-        acc[refId]++
+    const sorted = [...countMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
 
-        return acc
-      },
-      {} as Record<string, number>,
-    )
-
-    const result = [] as {
-      refId: string
-      count: number
-      ref: PostModel | NoteModel | PageModel | RecentlyModel
-    }[]
-
-    const idsCollections = await this.databaseService.findGlobalByIds(
-      Array.from(refIds),
-    )
-
+    const topRefIds = sorted.map(([id]) => id)
+    const idsCollections = await this.databaseService.findGlobalByIds(topRefIds)
     const mapping = this.databaseService.flatCollectionToMap(idsCollections)
-    for (const refId of refIds) {
-      result.push({
-        refId,
-        count: activityCountingMap[refId] ?? 0,
-        ref: mapping[refId],
-      })
-    }
 
-    return result
+    return sorted.map(([refId, count]) => ({
+      refId,
+      count,
+      ref: mapping[refId],
+    }))
+  }
+
+  async getTopReadings(limit = 5, days = 14) {
+    const endAt = new Date()
+    const startAt = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+
+    return this.getDateRangeOfReadings(startAt, endAt, limit)
   }
 
   async getRecentComment() {
     const configs = await this.configsService.get('commentOptions')
     const { commentShouldAudit } = configs
 
-    const docs = await this.commentService.model
-      .find({
-        isWhispers: false,
-        state: commentShouldAudit
-          ? CommentState.Read
-          : {
-              $in: [CommentState.Read, CommentState.Unread],
-            },
-      })
-
-      .populate('ref', 'title nid slug subtitle content categoryId')
-
-      .lean({ getters: true })
-      .sort({
-        created: -1,
-      })
-      .limit(3)
-
-    await this.commentService.fillAndReplaceAvatarUrl(docs)
-    return docs.map((doc) => {
-      return Object.assign(
-        {},
-        pick(doc, 'created', 'author', 'text', 'avatar'),
-        pick(doc.ref, 'title', 'nid', 'slug', 'id'),
-        {
-          type: checkRefModelCollectionType(doc.ref),
-        },
-      )
+    const docs = await this.commentService.findRecent(3, {
+      state: commentShouldAudit ? CommentState.Read : undefined,
+      rootOnly: false,
     })
+
+    // For post refs, look up their categories separately
+    const refs = await this.databaseService.findGlobalByIds(
+      docs.map((doc) => doc.refId).filter(Boolean),
+    )
+    const refMap = this.databaseService.flatCollectionToMap(refs)
+    await this.commentService.fillAndReplaceAvatarUrl(docs)
+    return docs
+      .filter((doc) => doc.refId)
+      .map((doc) => {
+        const ref = refMap[String(doc.refId)]
+        return {
+          ...pick(doc, 'createdAt', 'author', 'text', 'avatar'),
+          ...pick(ref, 'title', 'nid', 'slug', 'id', 'category'),
+          type: checkRefModelCollectionType(ref),
+        }
+      })
   }
 
   async getRecentPublish() {
-    const [recent, post, note] = await Promise.all([
-      this.databaseService.db
-        .collection(RECENTLY_COLLECTION_NAME)
-        .find()
-        .project({
-          content: 1,
-          created: 1,
-          up: 1,
-          down: 1,
-        })
-        .sort({
-          created: -1,
-        })
-        .limit(3)
-
-        .toArray(),
-      this.databaseService.db
-        .collection(POST_COLLECTION_NAME)
-        .find()
-        .project({
-          title: 1,
-          slug: 1,
-          created: 1,
-          modified: 1,
-          category: 1,
-          categoryId: 1,
-        })
-        .sort({
-          created: -1,
-        })
-        .limit(3)
-        .toArray(),
-      // .aggregate([
-      //   {
-      //     $lookup: {
-      //       from: CATEGORY_COLLECTION_NAME,
-      //       localField: 'categoryId',
-      //       foreignField: '_id',
-      //       as: 'category',
-      //     },
-      //   },
-      //   {
-      //     $project: {
-      //       title: 1,
-      //       slug: 1,
-      //       created: 1,
-      //       category: {
-      //         $arrayElemAt: ['$category', 0],
-      //       },
-      //       categoryId: 1,
-      //       id: '$_id',
-      //     },
-      //   },
-      //   {
-      //     $sort: {
-      //       created: -1,
-      //     },
-      //   },
-      //   {
-      //     $limit: 3,
-      //   },
-      // ])
-      // .toArray(),
-      this.databaseService.db
-        .collection(NOTE_COLLECTION_NAME)
-        .find({
-          hide: false,
-        })
-        .sort({
-          created: -1,
-        })
-        .project({
-          title: 1,
-          nid: 1,
-          id: 1,
-          created: 1,
-          modified: 1,
-        })
-        .limit(3)
-        .toArray(),
+    const [posts, note] = await Promise.all([
+      this.postService.findRecent(3, { publishedOnly: true }),
+      this.noteService.findRecent(3, { visibleOnly: true }),
     ])
 
     return {
-      recent,
-      post,
+      recent: [],
+      post: posts.map((post) => ({
+        ...post,
+        text: getPublicText(post),
+        content: getPublicContent(post),
+      })),
       note,
     }
   }
 
   /**
-   * 获取过去一年的文章发布
+   * Fetch article publications from the past year.
    */
   async getLastYearPublication() {
     const $gte = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000)
-    const [posts, notes] = await Promise.all([
-      this.postService.model
-        .find({
-          created: {
-            $gte,
-          },
-        })
-        .select('title created slug categoryId category')
-        .sort({ created: -1 }),
-      this.noteService.model
-        .find(
-          {
-            created: {
-              $gte,
-            },
-          },
-          {
-            title: 1,
-            created: 1,
-            nid: 1,
-            weather: 1,
-            mood: 1,
-            bookmark: 1,
-            password: 1,
-            hide: 1,
-          },
-        )
-        .lean(),
+    const [allPosts, allNotes] = await Promise.all([
+      this.postService.findRecent(50, { publishedOnly: true }),
+      this.noteService.findRecent(50, { metaOnly: true, visibleOnly: true }),
     ])
-    return {
-      posts,
-      notes: notes.map((note) => {
-        if (note.password || note.hide) {
-          note.title = '未公开的日记'
-        }
-
-        return omit(note, 'password', 'hide')
-      }),
-    }
+    const posts = allPosts
+      .filter((row) => row.createdAt >= $gte)
+      .map((post) => ({
+        ...post,
+        text: getPublicText(post),
+        content: getPublicContent(post),
+      }))
+    const now = new Date()
+    const notes = allNotes
+      .filter(
+        (row) =>
+          row.createdAt >= $gte &&
+          row.isPublished &&
+          !row.hasPassword &&
+          (row.publicAt === null || row.publicAt <= now),
+      )
+      .map((note) =>
+        pick(note, [
+          'id',
+          'nid',
+          'title',
+          'mood',
+          'weather',
+          'bookmark',
+          'createdAt',
+        ]),
+      )
+    return { posts, notes }
   }
 }

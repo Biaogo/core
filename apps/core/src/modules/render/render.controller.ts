@@ -1,53 +1,57 @@
-import dayjs from 'dayjs'
-import { render } from 'ejs'
-import { isNil } from 'lodash'
-import xss from 'xss'
-import type { NoteModel } from '../note/note.model'
-import type { PageModel } from '../page/page.model'
-import type { PostModel } from '../post/post.model'
-
 import { CacheTTL } from '@nestjs/cache-manager'
 import {
   Body,
   Controller,
-  ForbiddenException,
   Get,
   Header,
+  HttpCode,
   Param,
   Post,
   Query,
 } from '@nestjs/common'
+import dayjs from 'dayjs'
+import ejs from 'ejs'
+import { isNil } from 'es-toolkit/compat'
+import xss, { escapeAttrValue, escapeHtml } from 'xss'
 
+import { RequestContext } from '~/common/contexts/request.context'
 import { Auth } from '~/common/decorators/auth.decorator'
 import { HttpCache } from '~/common/decorators/cache.decorator'
 import { HTTPDecorators } from '~/common/decorators/http.decorator'
-import { IsAuthenticated } from '~/common/decorators/role.decorator'
-import { MongoIdDto } from '~/shared/dto/id.dto'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { CollectionRefTypes } from '~/constants/db.constant'
+import { type EntityIdDto, EntityIdSchema } from '~/shared/dto/id.dto'
 import { getShortDateTime } from '~/utils/time.util'
 
 import { ConfigsService } from '../configs/configs.service'
-import { MarkdownPreviewDto } from '../markdown/markdown.dto'
+import {
+  type MarkdownPreviewDto,
+  MarkdownPreviewSchema,
+} from '../markdown/markdown.schema'
 import { MarkdownService } from '../markdown/markdown.service'
-import { UserService } from '../user/user.service'
+import type { NoteModel } from '../note/note.types'
+import { OwnerService } from '../owner/owner.service'
+import type { PageModel } from '../page/page.types'
+import type { PostModel } from '../post/post.types'
 
 @Controller('/render')
-@HTTPDecorators.Bypass
 export class RenderEjsController {
   constructor(
     private readonly service: MarkdownService,
     private readonly configs: ConfigsService,
-    private readonly userService: UserService,
+    private readonly ownerService: OwnerService,
   ) {}
 
   @Get('/markdown/:id')
+  @HTTPDecorators.RawResponse
   @Header('content-type', 'text/html')
   @CacheTTL(60 * 60)
   async renderArticle(
-    @Param() params: MongoIdDto,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
     @Query('theme') theme: string,
-    @IsAuthenticated() isAuthenticated: boolean,
   ) {
     const { id } = params
+    const hasAdminAccess = RequestContext.hasAdminAccess()
     const now = performance.now()
     const [
       { html: markdownMacros, document, type },
@@ -56,29 +60,32 @@ export class RenderEjsController {
       },
       { name: username },
     ] = await Promise.all([
-      this.service.renderArticle(id),
+      this.service.renderArticle(id, { asOwner: hasAdminAccess }),
       this.configs.waitForConfigReady(),
-      this.userService.getMaster(),
+      this.ownerService.getOwner(),
     ])
 
     const isPrivateOrEncrypt =
-      ('hide' in document && document.hide) ||
+      ('isPublished' in document && !document.isPublished) ||
       ('password' in document && !isNil(document.password))
 
-    if (!isAuthenticated && isPrivateOrEncrypt) {
-      throw new ForbiddenException('该文章已隐藏或加密')
+    if (!hasAdminAccess && isPrivateOrEncrypt) {
+      throw createAppException(AppErrorCode.POST_HIDDEN_OR_ENCRYPTED)
     }
 
     const relativePath = (() => {
-      switch (type.toLowerCase()) {
-        case 'post':
+      switch (type) {
+        case CollectionRefTypes.Post: {
           return `/posts/${((document as PostModel).category as any).slug}/${
             (document as PostModel).slug
           }`
-        case 'note':
+        }
+        case CollectionRefTypes.Note: {
           return `/notes/${(document as NoteModel).nid}`
-        case 'page':
+        }
+        case CollectionRefTypes.Page: {
           return `/${(document as PageModel).slug}`
+        }
       }
     })()
 
@@ -90,37 +97,34 @@ export class RenderEjsController {
       theme,
     )
 
-    const html = render(await this.service.getMarkdownEjsRenderTemplate(), {
+    const html = ejs.render(await this.service.getMarkdownEjsRenderTemplate(), {
       ...structure,
-      info: isPrivateOrEncrypt ? '正在查看的文章还未公开' : undefined,
+      info: isPrivateOrEncrypt ? 'This article is not yet public.' : undefined,
 
-      title: document.title,
-      footer: `<div>本文渲染于 ${getShortDateTime(
+      title: xss(document.title),
+      footer: `<div>Rendered on ${getShortDateTime(
         new Date(),
-      )}，由 marked.js 解析生成，用时 ${(performance.now() - now).toFixed(
-        2,
-      )}ms</div>
-      <div>作者：${username}，撰写于${dayjs(document.created).format(
-        'llll',
-      )}</div>
-        <div>原文地址：<a href="${url}">${decodeURIComponent(
+      )} by marked.js, in ${(performance.now() - now).toFixed(2)}ms</div>
+      <div>Author: ${escapeHtml(username)}, written on ${dayjs(
+        document.createdAt,
+      ).format('llll')}</div>
+        <div>Original URL: <a href="${escapeAttrValue(
           url.toString(),
-        )}</a></div>
+        )}">${escapeHtml(decodeURIComponent(url.toString()))}</a></div>
         `,
     })
 
     return html.trim()
   }
 
-  /**
-   * 后台预览 Markdown 可用接口，传入 `title` 和 `md`
-   */
   @Post('/markdown')
+  @HttpCode(200)
+  @HTTPDecorators.RawResponse
   @HttpCache.disable
   @Auth()
   @Header('content-type', 'text/html')
   async markdownPreview(
-    @Body() body: MarkdownPreviewDto,
+    @Body({ schema: MarkdownPreviewSchema }) body: MarkdownPreviewDto,
     @Query('theme') theme: string,
   ) {
     const { md, title } = body
@@ -130,10 +134,12 @@ export class RenderEjsController {
       title,
       theme,
     )
-    return render(await this.service.getMarkdownEjsRenderTemplate(), {
-      ...structure,
+    return ejs
+      .render(await this.service.getMarkdownEjsRenderTemplate(), {
+        ...structure,
 
-      title: xss(title),
-    }).trim()
+        title: xss(title),
+      })
+      .trim()
   }
 }

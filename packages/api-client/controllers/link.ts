@@ -1,12 +1,10 @@
 import type { IRequestAdapter } from '~/interfaces/adapter'
 import type { LinkModel } from '~/models/link'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
-
+import type { HTTPClient } from '../core'
 import { BaseCrudController } from './base'
 
-declare module '../core/client' {
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,

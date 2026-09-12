@@ -4,14 +4,16 @@ import type {
   NestModule,
   Provider,
 } from '@nestjs/common'
-import type { AuthInstance } from './auth.interface'
 
 import { API_VERSION } from '~/app.config'
 
 import { AuthInstanceInjectKey } from './auth.constant'
 import { AuthController } from './auth.controller'
+import type { AuthInstance } from './auth.interface'
 import { AuthMiddleware } from './auth.middleware'
+import { AuthRepository } from './auth.repository'
 import { AuthService } from './auth.service'
+import { DeviceController } from './device.controller'
 
 export class AuthModule implements NestModule {
   static forRoot(): DynamicModule {
@@ -30,12 +32,12 @@ export class AuthModule implements NestModule {
     }
 
     return {
-      controllers: [AuthController],
-      exports: [AuthService, authProvider],
+      controllers: [AuthController, DeviceController],
+      exports: [AuthService, AuthRepository, authProvider],
       module: AuthModule,
       global: true,
 
-      providers: [AuthService, authProvider],
+      providers: [AuthService, AuthRepository, authProvider],
     }
   }
 

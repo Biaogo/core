@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/prefer-literal-enum-member */
 export enum RedisKeys {
   AccessIp = 'access_ip',
   Like = 'like',
@@ -7,28 +6,42 @@ export enum RedisKeys {
   MaxOnlineCount = 'max_online_count',
   IpInfoMap = 'ip_info_map',
   LikeSite = 'like_site',
-  /** 后台管理入口页面缓存 */
+  /** Admin dashboard entry page cache */
   AdminPage = 'admin_next_index_entry',
-  /** 配置项缓存 */
+  /** Configuration cache */
   ConfigCache = 'config_cache',
+  /** Configuration version number */
+  ConfigVersion = 'config_version',
   PTYSession = 'pty_session',
-  /** HTTP 请求缓存 */
+  /** HTTP request cache */
   HTTPCache = 'http_cache',
-  /** Snippet 缓存 */
+  /** Snippet cache */
   SnippetCache = 'snippet_cache',
+  /** Translation glossary cache */
+  TranslationEntryDict = 'translation_entry_dict',
 
-  /** 云函数缓存数据 */
+  /** Serverless function cache storage */
   ServerlessStorage = 'serverless_storage',
 
   JWTStore = 'jwt_store',
-  /** 最近速记的点赞，点踩记录 */
+  /** Like/dislike records for recent shorthand entries */
   RecentlyAttitude = 'recently_attitude',
-  /** 函数编译缓存 */
-  FunctionComplieCache = 'function_complie_cache',
-
-  Authn = 'authn',
-
   Socket = 'socket',
+  ClusterEventStream = 'cluster_event_stream',
+
+  AnalyzeAggregate = 'analyze_aggregate',
+  AnalyzeTrafficSource = 'analyze_traffic_source',
+  AnalyzeDeviceDistribution = 'analyze_device_distribution',
+
+  /** NX lock to throttle Enrichment capture LRU touchAccess */
+  EnrichmentCaptureTouch = 'enrichment_capture_touch',
+
+  WsBus = 'ws_bus',
+  WsNode = 'ws_node',
+  WsNodes = 'ws_nodes',
+  WsConns = 'ws_conns',
+  WsRoom = 'ws_room',
+  WsRooms = 'ws_rooms',
 }
 export const API_CACHE_PREFIX = 'mx-api-cache:'
 export enum CacheKeys {
@@ -37,7 +50,5 @@ export enum CacheKeys {
   RSS = `${API_CACHE_PREFIX}rss`,
   RSSXml = `${API_CACHE_PREFIX}rss_xml`,
   Aggregate = `${API_CACHE_PREFIX}aggregate`,
+  AggregateSite = `${API_CACHE_PREFIX}aggregate_site`,
 }
-
-// 30 days
-export const SERVERLESS_COMPLIE_CACHE_TTL = 60 * 60 * 24 * 30

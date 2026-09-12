@@ -1,61 +1,76 @@
-/**
- * 对响应体进行转换结构
- * @author Innei
- */
-import { isArrayLike } from 'lodash'
-import { map } from 'rxjs/operators'
 import type {
   CallHandler,
   ExecutionContext,
   NestInterceptor,
 } from '@nestjs/common'
-import type { Observable } from 'rxjs'
-
 import { Injectable } from '@nestjs/common'
 import { Reflector } from '@nestjs/core'
+import type { Observable } from 'rxjs'
+import { map } from 'rxjs/operators'
 
-import { HTTP_RES_TRANSFORM_PAGINATE } from '~/constants/meta.constant'
-import * as SYSTEM from '~/constants/system.constant'
-import { transformDataToPaginate } from '~/transformers/paginate.transformer'
-
-export interface Response<T> {
-  data: T
-}
+import {
+  BYPASS_CASE_TRANSFORM_ROOT,
+  transformResponseCase,
+} from '~/common/response/case-transform'
+import {
+  isExplicitSuccessEnvelope,
+  type SuccessEnvelope,
+} from '~/common/response/envelope.types'
+import {
+  BYPASS_CASE_TRANSFORM_METADATA,
+  RESPONSE_PASSTHROUGH_METADATA,
+} from '~/constants/system.constant'
+import { isHttpExecutionContext } from '~/transformers/get-req.transformer'
 
 @Injectable()
-export class ResponseInterceptor<T> implements NestInterceptor<T, Response<T>> {
+export class ResponseInterceptor implements NestInterceptor {
   constructor(private readonly reflector: Reflector) {}
-  intercept(
-    context: ExecutionContext,
-    next: CallHandler,
-  ): Observable<Response<T>> {
-    if (!context.switchToHttp().getRequest()) {
-      return next.handle()
-    }
-    const handler = context.getHandler()
-    const classType = context.getClass()
 
-    // 跳过 bypass 装饰的请求
-    const bypass = this.reflector.getAllAndOverride<boolean>(
-      SYSTEM.RESPONSE_PASSTHROUGH_METADATA,
-      [classType, handler],
-    )
-    if (bypass) {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    if (!isHttpExecutionContext(context)) {
       return next.handle()
     }
+
+    const http = context.switchToHttp()
+    if (!http.getRequest()) {
+      return next.handle()
+    }
+
+    const passthrough = this.reflector.getAllAndOverride<boolean>(
+      RESPONSE_PASSTHROUGH_METADATA,
+      [context.getClass(), context.getHandler()],
+    )
+    if (passthrough) {
+      return next.handle()
+    }
+
+    const bypassMetadata = this.reflector.getAllAndOverride<string[]>(
+      BYPASS_CASE_TRANSFORM_METADATA,
+      [context.getHandler(), context.getClass()],
+    )
+    const bypassPaths = Array.isArray(bypassMetadata) ? bypassMetadata : []
 
     return next.handle().pipe(
       map((data) => {
         if (typeof data === 'undefined') {
-          context.switchToHttp().getResponse().status(204)
+          http.getResponse().status(204)
           return data
         }
-        // 分页转换
-        if (this.reflector.get(HTTP_RES_TRANSFORM_PAGINATE, handler)) {
-          return transformDataToPaginate(data)
+        const envelope: SuccessEnvelope = isExplicitSuccessEnvelope(data)
+          ? data
+          : { data }
+        const result: SuccessEnvelope = {
+          data: transformResponseCase(envelope.data, bypassPaths),
         }
-
-        return isArrayLike(data) ? { data } : data
+        if (envelope.meta !== undefined) {
+          result.meta = transformResponseCase(
+            envelope.meta,
+            bypassPaths.includes(BYPASS_CASE_TRANSFORM_ROOT)
+              ? [BYPASS_CASE_TRANSFORM_ROOT]
+              : [],
+          ) as SuccessEnvelope['meta']
+        }
+        return result
       }),
     )
   }

@@ -1,27 +1,23 @@
+import { Injectable } from '@nestjs/common'
+
 import type { ArticleTypeEnum } from '~/constants/article.constant'
 
-import { Injectable } from '@nestjs/common'
-import { ReturnModelType } from '@typegoose/typegoose'
-
-import { InjectModel } from '~/transformers/model.transformer'
-
-import { SlugTrackerModel } from './slug-tracker.model'
+import { SlugTrackerRepository } from './slug-tracker.repository'
 
 @Injectable()
 export class SlugTrackerService {
-  constructor(
-    @InjectModel(SlugTrackerModel)
-    private readonly slugTrackerModel: ReturnModelType<typeof SlugTrackerModel>,
-  ) {}
+  constructor(private readonly slugTrackerRepository: SlugTrackerRepository) {}
 
   createTracker(slug: string, type: ArticleTypeEnum, targetId: string) {
-    return this.slugTrackerModel.create({ slug, type, targetId })
+    return this.slugTrackerRepository.createTracker(slug, type, targetId)
   }
 
   findTrackerBySlug(slug: string, type: ArticleTypeEnum) {
-    return this.slugTrackerModel.findOne({ slug, type }).lean()
+    return this.slugTrackerRepository.findBySlug(slug, type)
   }
-  deleteAllTracker(targetId: string) {
-    return this.slugTrackerModel.deleteMany({ targetId })
+  deleteAllTracker(targetId: string, type?: ArticleTypeEnum) {
+    return type
+      ? this.slugTrackerRepository.deleteAllForTarget(type, targetId)
+      : this.slugTrackerRepository.deleteAllForTargetId(targetId)
   }
 }

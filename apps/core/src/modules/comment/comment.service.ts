@@ -1,679 +1,1195 @@
-import { URL } from 'node:url'
-import { render } from 'ejs'
-import { omit, pick } from 'lodash'
-import { isObjectIdOrHexString, Types } from 'mongoose'
-import type { OnModuleInit } from '@nestjs/common'
-import type { ReturnModelType } from '@typegoose/typegoose/lib/types'
-import type { WriteBaseModel } from '~/shared/model/write-base.model'
-import type { SnippetModel } from '../snippet/snippet.model'
-import type {
-  CommentEmailTemplateRenderProps,
-  CommentModelRenderProps,
-} from './comment.email.default'
-
-import {
-  BadRequestException,
-  forwardRef,
-  Inject,
-  Injectable,
-  Logger,
-} from '@nestjs/common'
+import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common'
 import { OnEvent } from '@nestjs/event-emitter'
 
 import { RequestContext } from '~/common/contexts/request.context'
-import { CannotFindException } from '~/common/exceptions/cant-find.exception'
-import { NoContentCanBeModifiedException } from '~/common/exceptions/no-content-canbe-modified.exception'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { CollectionRefTypes } from '~/constants/db.constant'
 import { DatabaseService } from '~/processors/database/database.service'
-import { BarkPushService } from '~/processors/helper/helper.bark.service'
-import { EmailService } from '~/processors/helper/helper.email.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
-import { InjectModel } from '~/transformers/model.transformer'
-import { scheduleManager } from '~/utils/schedule.util'
-import { getAvatar, hasChinese } from '~/utils/tool.util'
+import { RedisService } from '~/processors/redis/redis.service'
+import { getAvatar } from '~/utils/tool.util'
 
-import { AiService } from '../ai/ai.service'
-import { ConfigsService } from '../configs/configs.service'
-import { ReaderModel } from '../reader/reader.model'
+import { FileReferenceService } from '../file/file-reference.service'
+import { FileDeletionReason } from '../file/file-reference.types'
+import { OwnerService } from '../owner/owner.service'
 import { ReaderService } from '../reader/reader.service'
-import { createMockedContextResponse } from '../serverless/mock-response.util'
-import { ServerlessService } from '../serverless/serverless.service'
-import { SnippetType } from '../snippet/snippet.model'
-import { UserModel } from '../user/user.model'
-import { UserService } from '../user/user.service'
-import BlockedKeywords from './block-keywords.json'
-import {
-  baseRenderProps,
-  defaultCommentModelKeys,
-} from './comment.email.default'
-import { CommentReplyMailType } from './comment.enum'
-import { CommentModel, CommentState } from './comment.model'
+import { type ReaderModel } from '../reader/reader.types'
+import { CommentState } from './comment.enum'
+import { CommentRepository } from './comment.repository'
+import type {
+  AuthorActivity,
+  AuthorActivityFilter,
+  AuthorThreatLevel,
+  CommentFindFilter,
+  CommentModel,
+  CommentRefType,
+  CommentRow,
+  CommentTab,
+  CommentTabCounts,
+  CommentTabCountsFilter,
+} from './comment.types'
+import { CommentCountryService } from './comment-country.service'
+
+/**
+ * Minimal hydrated reference attached to a comment when its `refType`/`refId`
+ * resolve to a post/note/page/recently. Mirrors the surface that admin
+ * `comment-detail.tsx` reads (`ref.title`, `ref.slug`, `ref.nid`,
+ * `ref.category.slug`).
+ */
+export type CommentRefSummary = {
+  id: string
+  type: CollectionRefTypes
+  title?: string
+  slug?: string | null
+  nid?: number
+  category?: { name: string; slug: string } | null
+}
+
+export type CommentSourceCandidateSummary = CommentRefSummary & {
+  commentCount: number
+  latestCommentAt: Date
+}
+
+/**
+ * Slim parent-comment preview attached to replies. Only the surface that the
+ * admin `comment-detail.tsx` renders (`@author`, body text, deletion state).
+ * Intentionally omits `ip`/`agent`/`mail`/etc. so the `/comments/:id` public
+ * detail endpoint does not leak parent commenter PII.
+ */
+export type CommentParentPreview = {
+  id: string
+  author: string | null
+  text: string
+  isDeleted: boolean
+}
+
+const COMMENT_REPLY_THRESHOLD = 20
+const COMMENT_REPLY_EDGE_SIZE = 3
+const COMMENT_THREAD_BATCH_SIZE = 10
+const COMMENT_DELETED_PLACEHOLDER = 'This comment has been deleted'
+
+const TAB_COUNTS_KEY_PREFIX = 'comment:tab-counts:'
+const TAB_COUNTS_TTL_SECONDS = 30
+const AUTHOR_ACTIVITY_KEY_PREFIX = 'comment:author-activity:'
+const AUTHOR_ACTIVITY_TTL_SECONDS = 300
+const COMMENT_REPORT_KEY_PREFIX = 'comment:report:'
+const COMMENT_REPORT_TTL_SECONDS = 60 * 60 * 24 * 90
+
+const DEFAULT_STATE_TO_TAB: Record<number, CommentTab> = {
+  0: 'unread',
+  1: 'read',
+  2: 'junk',
+}
 
 @Injectable()
-export class CommentService implements OnModuleInit {
+export class CommentService {
   private readonly logger: Logger = new Logger(CommentService.name)
+  private deprecatedStateWarned = false
+
   constructor(
-    @InjectModel(CommentModel)
-    private readonly commentModel: MongooseModel<CommentModel>,
-
+    private readonly commentRepository: CommentRepository,
     private readonly databaseService: DatabaseService,
-    private readonly configs: ConfigsService,
-    private readonly userService: UserService,
-    private readonly mailService: EmailService,
-
-    private readonly configsService: ConfigsService,
-    @Inject(forwardRef(() => AiService))
-    private readonly aiService: AiService,
-    @Inject(forwardRef(() => ServerlessService))
-    private readonly serverlessService: ServerlessService,
+    private readonly ownerService: OwnerService,
     private readonly eventManager: EventManagerService,
-    private readonly barkService: BarkPushService,
     @Inject(forwardRef(() => ReaderService))
     private readonly readerService: ReaderService,
+    @Inject(forwardRef(() => FileReferenceService))
+    private readonly fileReferenceService: FileReferenceService,
+    private readonly commentCountryService: CommentCountryService,
+    private readonly redisService: RedisService,
   ) {}
 
-  private async getMailOwnerProps() {
-    const masterInfo = await this.userService.getSiteMasterOrMocked()
-    return UserModel.serialize(masterInfo)
+  /**
+   * Pull `cf-ipcountry` off the current request (set by the Cloudflare edge)
+   * so it can be passed to the geoip lookup as a free hint. Returns null when
+   * the request is not bound (background work) or the header is absent.
+   */
+  private currentCfIpCountryHint(): string | null {
+    const request = RequestContext.currentRequest()
+    if (!request) return null
+    const headers = request.headers ?? {}
+    const raw =
+      headers['cf-ipcountry'] ??
+      (headers as Record<string, unknown>)['CF-IPCountry']
+    return typeof raw === 'string' ? raw : null
   }
 
-  async onModuleInit() {
-    const masterInfo = await this.getMailOwnerProps()
-    const renderProps = {
-      ...baseRenderProps,
-
-      master: masterInfo.name,
-
-      aggregate: {
-        ...baseRenderProps.aggregate,
-        owner: omit(masterInfo, [
-          'password',
-          'apiToken',
-          'lastLoginIp',
-          'lastLoginTime',
-          'oauth2',
-        ] as (keyof UserModel)[]),
-      },
-    }
-    this.mailService.registerEmailType(CommentReplyMailType.Guest, {
-      ...renderProps,
-    })
-    this.mailService.registerEmailType(CommentReplyMailType.Owner, {
-      ...renderProps,
-    })
-  }
-  public get model() {
-    return this.commentModel
-  }
-
-  private getModelByRefType(
-    type: CollectionRefTypes,
-  ): ReturnModelType<typeof WriteBaseModel> {
-    return this.databaseService.getModelByRefType(type) as any
-  }
-
-  async checkSpam(doc: CommentModel) {
-    const res = await (async () => {
-      const commentOptions = await this.configs.get('commentOptions')
-      if (!commentOptions.antiSpam) {
-        return false
-      }
-      const master = await this.userService.getMaster()
-      if (doc.author === master.username) {
-        return false
-      }
-      if (commentOptions.blockIps) {
-        if (!doc.ip) {
-          return false
-        }
-        const isBlock = commentOptions.blockIps.some((ip) =>
-          // @ts-ignore
-          new RegExp(ip, 'gi').test(doc.ip),
+  /**
+   * Cascade-clean uploaded files when batch-updating comment state.
+   * Moving comments to Junk (state=2) triggers hard deletion of the
+   * associated reader-uploaded files (per configuration).
+   */
+  async cascadeFilesForCommentsIfSpam(commentIds: string[], state: number) {
+    if (state !== CommentState.Junk) return
+    for (const id of commentIds) {
+      try {
+        await this.fileReferenceService.hardDeleteFilesForComment(
+          id,
+          FileDeletionReason.CommentSpam,
         )
-        if (isBlock) {
-          return true
-        }
+      } catch (err) {
+        this.logger.warn(
+          `cascadeFilesForCommentsIfSpam(${id}) failed: ${err instanceof Error ? err.message : err}`,
+        )
       }
-
-      const customKeywords = commentOptions.spamKeywords || []
-      const isBlock = [...customKeywords, ...BlockedKeywords].some((keyword) =>
-        new RegExp(keyword, 'gi').test(doc.text),
-      )
-
-      if (isBlock) {
-        return true
-      }
-
-      if (commentOptions.disableNoChinese && !hasChinese(doc.text)) {
-        return true
-      }
-
-      if (commentOptions.aiReview) {
-        const openai = await this.aiService.getOpenAiChain()
-        const { aiReviewType, aiReviewThreshold } = commentOptions
-        const runnable = openai
-
-        const prompt =
-          aiReviewType === 'score'
-            ? 'Check the comment and return a risk score directly. Higher means more risky (1-10). Outputs should only be a number'
-            : 'Check if the comment is spam or not. Outputs should be true or false(Lowercase)'
-
-        const result = (await runnable.invoke([`${prompt}:${doc.text}`]))
-          .content
-
-        if (aiReviewType === 'score') {
-          return (result as any) > aiReviewThreshold
-        }
-        return result === 'true'
-      }
-      return false
-    })()
-    if (res) {
-      this.logger.warn(
-        '--> 检测到一条垃圾评论：' +
-          `作者：${doc.author}, IP: ${doc.ip}, 内容为：${doc.text}`,
-      )
     }
-    return res
   }
 
-  async assignReaderToComment(
-    doc: Partial<CommentModel>,
-  ): Promise<(ReaderModel & { id: string }) | null> {
-    const readerId = RequestContext.currentRequest()?.readerId
-
-    let reader: ReaderModel | null = null
-    if (readerId) {
-      reader = await this.readerService
-        .findReaderInIds([readerId])
-        .then((readers) => readers[0] ?? null)
-    }
-
-    if (!reader) {
-      return null
-    }
-    doc.author = reader.name
-    doc.mail = reader.email
-    doc.avatar = reader.image
-
-    return { ...reader, id: readerId! }
+  public get repository() {
+    return this.commentRepository
   }
+
+  private async assignReaderToComment(): Promise<
+    (ReaderModel & { id: string }) | null
+  > {
+    const readerId = RequestContext.currentReaderId()
+    if (!readerId) return null
+    const readers = await this.readerService.findReaderInIds([readerId])
+    const reader = readers[0] ?? null
+    return reader ? { ...reader, id: readerId } : null
+  }
+
+  private stripReaderIdentitySnapshot(doc: Partial<CommentModel>) {
+    delete doc.author
+    delete doc.mail
+    delete doc.avatar
+    delete doc.url
+  }
+
+  private assignAuthProviderToComment(doc: Partial<CommentModel>) {
+    const authProvider = RequestContext.currentAuthProvider()
+    if (authProvider) doc.authProvider = authProvider
+  }
+
+  async findById(id: string) {
+    return this.commentRepository.findById(id)
+  }
+
+  async findByIdWithRelations(id: string) {
+    const comment = await this.commentRepository.findByIdWithRelations(id)
+    if (!comment) return comment
+    const [withRef] = await this.attachRef([comment])
+    const parentRow = withRef.parent ?? null
+    let parent: CommentParentPreview | null = null
+    if (parentRow) {
+      await this.fillAndReplaceAvatarUrl([parentRow as CommentModel])
+      parent = this.toParentPreview(parentRow)
+    }
+    return { ...withRef, parent }
+  }
+
+  /**
+   * Resolve the polymorphic `(refType, refId)` on each comment to a small
+   * joined `ref` summary. Batched via `databaseService.findGlobalByIds`.
+   *
+   * Orphan refs (target deleted) become `ref: null` so consumers may render a
+   * degraded label instead of crashing on `comment.ref.title`.
+   */
+  async attachRef<
+    T extends Pick<CommentRow, 'refId' | 'refType'> & { id: any },
+  >(rows: T[]): Promise<Array<T & { ref?: CommentRefSummary | null }>> {
+    if (rows.length === 0) return []
+    const refIds = [
+      ...new Set(rows.map((r) => r.refId).filter((id): id is any => !!id)),
+    ].map(String)
+    if (refIds.length === 0) {
+      return rows.map((row) => ({ ...row, ref: null }))
+    }
+
+    const collection = await this.databaseService.findGlobalByIds(refIds)
+    const flat = this.databaseService.flatCollectionToMap(collection)
+    const typeMap = new Map<string, CollectionRefTypes>()
+    for (const item of collection.posts)
+      typeMap.set(item.id, CollectionRefTypes.Post)
+    for (const item of collection.notes)
+      typeMap.set(item.id, CollectionRefTypes.Note)
+    for (const item of collection.pages)
+      typeMap.set(item.id, CollectionRefTypes.Page)
+    for (const item of collection.recentlies)
+      typeMap.set(item.id, CollectionRefTypes.Recently)
+
+    return rows.map((row) => {
+      if (!row.refId) return { ...row, ref: null }
+      const refIdStr = String(row.refId)
+      const doc = flat[refIdStr]
+      const type = typeMap.get(refIdStr)
+      if (!doc || !type) return { ...row, ref: null }
+      return { ...row, ref: this.buildCommentRefSummary(type, doc) }
+    })
+  }
+
+  /**
+   * Resolve the `parentCommentId` on each row to a slim `parent` preview.
+   * Batched via `findManyByIds`; reader/owner identity is resolved on the
+   * parent rows so `parent.author` reflects the same name the dashboard would
+   * render for the parent itself.
+   */
+  async attachParentPreview<T extends Pick<CommentRow, 'parentCommentId'>>(
+    rows: T[],
+  ): Promise<Array<T & { parent: CommentParentPreview | null }>> {
+    if (rows.length === 0) return []
+
+    const parentIds = [
+      ...new Set(
+        rows
+          .map((r) => r.parentCommentId)
+          .filter((id): id is NonNullable<typeof id> => !!id)
+          .map((id) => String(id)),
+      ),
+    ]
+
+    if (parentIds.length === 0) {
+      return rows.map((row) => ({ ...row, parent: null }))
+    }
+
+    const parents = await this.commentRepository.findManyByIds(parentIds)
+    if (parents.length > 0) {
+      await this.fillAndReplaceAvatarUrl(parents as CommentModel[])
+    }
+    const previewMap = new Map<string, CommentParentPreview>()
+    for (const parent of parents) {
+      previewMap.set(String(parent.id), this.toParentPreview(parent))
+    }
+
+    return rows.map((row) => {
+      const pid = row.parentCommentId ? String(row.parentCommentId) : null
+      return {
+        ...row,
+        parent: pid ? (previewMap.get(pid) ?? null) : null,
+      }
+    })
+  }
+
+  private toParentPreview(row: CommentRow): CommentParentPreview {
+    return {
+      id: String(row.id),
+      author: row.author,
+      text: row.text,
+      isDeleted: row.isDeleted,
+    }
+  }
+
+  private buildCommentRefSummary(
+    type: CollectionRefTypes,
+    doc: any,
+  ): CommentRefSummary {
+    const summary: CommentRefSummary = {
+      id: doc.id,
+      type,
+      title: doc.title,
+    }
+    if (type === CollectionRefTypes.Note) {
+      summary.nid = doc.nid
+      summary.slug = doc.slug ?? null
+    } else if (type === CollectionRefTypes.Post) {
+      summary.slug = doc.slug
+      summary.category = doc.category
+        ? { name: doc.category.name, slug: doc.category.slug }
+        : null
+    } else if (type === CollectionRefTypes.Page) {
+      summary.slug = doc.slug
+    }
+    return summary
+  }
+
+  async deleteForRef(
+    refType: CollectionRefTypes | CommentRefType,
+    refId: string,
+  ) {
+    return this.commentRepository.deleteForRef(refType as CommentRefType, refId)
+  }
+
+  async countByRef(
+    refType: CollectionRefTypes | CommentRefType,
+    refId: string,
+  ) {
+    return this.commentRepository.countByRef(refType as CommentRefType, refId)
+  }
+
+  async countManyByRef(
+    refType: CollectionRefTypes | CommentRefType,
+    refIds: Array<string>,
+  ): Promise<Map<string, number>> {
+    return this.commentRepository.countManyByRef(
+      refType as CommentRefType,
+      refIds,
+    )
+  }
+
+  async countByState(state: number, rootOnly = false) {
+    return this.commentRepository.countByState(state, rootOnly)
+  }
+
+  async count() {
+    return this.commentRepository.count()
+  }
+
+  async findRecent(
+    size: number,
+    options: { state?: number; rootOnly?: boolean } = {},
+  ) {
+    return this.commentRepository.findRecent(size, options)
+  }
+
   async createComment(
     id: string,
     doc: Partial<CommentModel>,
     type?: CollectionRefTypes,
   ) {
-    const reader = await this.assignReaderToComment(doc)
+    const reader = await this.assignReaderToComment()
+    if (reader) {
+      this.stripReaderIdentitySnapshot(doc)
+      this.assignAuthProviderToComment(doc)
+    }
 
-    let ref: (WriteBaseModel & { _id: any }) | null = null
     let refType = type
-    if (type) {
-      const model = this.getModelByRefType(type)
-
-      ref = await model.findById(id).lean()
-    } else {
+    if (!refType) {
       const result = await this.databaseService.findGlobalById(id)
-      if (result) {
-        const { type, document } = result
-        ref = document as any
-        refType = type
-      }
+      if (result) refType = result.type
     }
-    if (!ref) {
-      throw new BadRequestException('评论文章不存在')
-    }
-    const commentIndex = ref.commentsIndex || 0
-    doc.key = `#${commentIndex + 1}`
+    if (!refType) throw createAppException(AppErrorCode.COMMENT_POST_NOT_EXISTS)
 
-    const comment = await this.commentModel.create({
-      ...doc,
-      state: CommentState.Unread,
-      ref: new Types.ObjectId(id),
-      readerId: reader ? reader.id : undefined,
-      refType,
-    })
-
-    await this.databaseService.getModelByRefType(refType!).updateOne(
-      { _id: ref._id },
-      {
-        $inc: {
-          commentsIndex: 1,
-        },
-      },
+    const countryCode = await this.commentCountryService.lookupCountryCode(
+      doc.ip,
+      { cfHint: this.currentCfIpCountryHint() },
     )
 
+    const comment = await this.commentRepository.create({
+      text: doc.text!,
+      author: doc.author,
+      mail: doc.mail,
+      url: doc.url,
+      avatar: doc.avatar,
+      authProvider: doc.authProvider,
+      meta: doc.meta as any,
+      anchor: doc.anchor as any,
+      ip: doc.ip,
+      agent: doc.agent,
+      location: doc.location,
+      isWhispers: doc.isWhispers,
+      countryCode,
+      state: RequestContext.hasAdminAccess()
+        ? CommentState.Read
+        : CommentState.Unread,
+      refId: id,
+      refType: refType as CommentRefType,
+      parentCommentId: null,
+      rootCommentId: null,
+      readerId: reader ? reader.id : undefined,
+    })
+
+    await this.invalidateTabCountsCache()
     return comment
   }
 
-  async afterCreateComment(
-    commentId: string,
-    ipLocation: { ip: string },
-    isAuthenticated: boolean,
-  ) {
-    const comment = await this.commentModel
-      .findById(commentId)
-      .lean({
-        getters: true,
-      })
-      .select('+ip +agent')
-
-    const readerId = RequestContext.currentRequest()?.readerId
-    if (!comment) return
-    scheduleManager.schedule(async () => {
-      if (isAuthenticated) {
-        return
-      }
-      await this.appendIpLocation(commentId, ipLocation.ip)
-    })
-
-    scheduleManager.batch(async () => {
-      const configs = await this.configsService.get('commentOptions')
-      const { commentShouldAudit } = configs
-      if ((await this.checkSpam(comment)) && !readerId) {
-        await this.commentModel.updateOne(
-          { _id: commentId },
-          {
-            state: CommentState.Junk,
-          },
-        )
-
-        return
-      } else if (!isAuthenticated) {
-        this.sendEmail(comment, CommentReplyMailType.Owner)
-      }
-
-      await this.eventManager.broadcast(
-        BusinessEvents.COMMENT_CREATE,
-        comment,
-        {
-          scope: EventScope.TO_SYSTEM_ADMIN,
-        },
-      )
-
-      if (commentShouldAudit || comment.isWhispers) {
-        /* empty */
-      } else {
-        await this.eventManager.broadcast(
-          BusinessEvents.COMMENT_CREATE,
-          omit(comment, ['ip', 'agent']),
-          {
-            scope: EventScope.TO_VISITOR,
-          },
-        )
-      }
-    })
-  }
-
   async validAuthorName(author: string): Promise<void> {
-    const isExist = await this.userService.model.findOne({
-      name: author,
-    })
+    const isExist = await this.ownerService.isOwnerName(author)
     if (isExist) {
-      throw new BadRequestException(
-        '用户名与主人重名啦，但是你好像并不是我的主人唉',
-      )
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message:
+          "That name belongs to the site owner, and you don't look like them.",
+      })
     }
   }
 
-  async deleteComments(id: string) {
-    const comment = await this.commentModel.findById(id).lean()
-    if (!comment) {
-      throw new NoContentCanBeModifiedException()
+  async replyComment(id: string, doc: Partial<CommentModel>) {
+    const parent = await this.commentRepository.findById(id)
+    if (!parent) throw createAppException(AppErrorCode.NOT_FOUND)
+
+    const reader = await this.assignReaderToComment()
+    if (reader) {
+      this.stripReaderIdentitySnapshot(doc)
+      this.assignAuthProviderToComment(doc)
     }
 
-    const { children, parent } = comment
-    if (children && children.length > 0) {
-      await Promise.all(
-        children.map(async (id) => {
-          await this.deleteComments(id as any as string)
-        }),
-      )
-    }
-    if (parent) {
-      const parent = await this.commentModel.findById(comment.parent)
-      if (parent) {
-        await parent.updateOne({
-          $pull: {
-            children: comment._id,
-          },
+    // When the owner replies to an unread comment, mark the parent as read.
+    if (
+      RequestContext.hasAdminAccess() &&
+      parent.state === CommentState.Unread
+    ) {
+      try {
+        await this.commentRepository.update(parent.id, {
+          state: CommentState.Read,
         })
+      } catch (err) {
+        this.logger.warn(
+          `auto mark parent ${parent.id} as read failed: ${err instanceof Error ? err.message : err}`,
+        )
       }
     }
-    await this.commentModel.deleteOne({ _id: id })
+
+    const countryCode = await this.commentCountryService.lookupCountryCode(
+      doc.ip,
+      { cfHint: this.currentCfIpCountryHint() },
+    )
+
+    const comment = await this.commentRepository.createReply({
+      text: doc.text!,
+      author: doc.author,
+      mail: doc.mail,
+      url: doc.url,
+      avatar: doc.avatar,
+      authProvider: doc.authProvider,
+      meta: doc.meta as any,
+      anchor: doc.anchor as any,
+      ip: doc.ip,
+      agent: doc.agent,
+      location: doc.location,
+      countryCode,
+      // Owner is the only admin-tier identity, so an authenticated reply is
+      // an owner reply. Drives the §6.1 awaiting predicate.
+      isOwnerReply: RequestContext.hasAdminAccess(),
+      state:
+        doc.state ??
+        (RequestContext.hasAdminAccess()
+          ? CommentState.Read
+          : CommentState.Unread),
+      refId: parent.refId,
+      refType: parent.refType,
+      parentCommentId: parent.id,
+      rootCommentId: parent.rootCommentId || parent.id,
+      isWhispers: parent.isWhispers,
+      readerId: reader ? reader.id : undefined,
+    })
+    await this.invalidateTabCountsCache()
+    return comment
   }
 
-  async allowComment(id: string, type?: CollectionRefTypes) {
-    if (type) {
-      const model = this.getModelByRefType(type)
-      const doc = await model.findById(id)
-      if (!doc) {
-        throw new CannotFindException()
-      }
-      return doc.allowComment ?? true
-    } else {
-      const result = await this.databaseService.findGlobalById(id)
-      if (!result) {
-        throw new CannotFindException()
-      }
-      return 'allowComment' in result ? result.allowComment : true
+  async softDeleteComment(id: string) {
+    const comment = await this.commentRepository.findById(id)
+    if (!comment) throw createAppException(AppErrorCode.NO_CONTENT_MODIFIABLE)
+    if (comment.isDeleted) return
+    await this.commentRepository.update(id, {
+      isDeleted: true,
+      text: COMMENT_DELETED_PLACEHOLDER,
+      editedAt: new Date(),
+    })
+    await this.invalidateTabCountsCache()
+    try {
+      await this.fileReferenceService.hardDeleteFilesForComment(
+        id,
+        FileDeletionReason.CommentDeleted,
+      )
+    } catch (err) {
+      this.logger.warn(
+        `cascade file delete after comment ${id} delete failed: ${err instanceof Error ? err.message : err}`,
+      )
     }
   }
 
-  async getComments({ page, size, state } = { page: 1, size: 10, state: 0 }) {
-    const queryList = await this.commentModel.paginate(
-      { state },
-      {
-        select: '+ip +agent -children',
-        page,
-        limit: size,
-        populate: [
-          { path: 'parent', select: '-children' },
+  async allowComment(id: string, _type?: CollectionRefTypes) {
+    const result = await this.databaseService.findGlobalById(id)
+    if (!result) throw createAppException(AppErrorCode.NOT_FOUND)
+    return 'allowComment' in result.document
+      ? (result.document as any).allowComment
+      : true
+  }
+
+  async allowCommentByCommentId(commentId: string) {
+    const comment = await this.commentRepository.findById(commentId)
+    if (!comment) throw createAppException(AppErrorCode.NOT_FOUND)
+    return this.allowComment(
+      comment.refId,
+      comment.refType as CollectionRefTypes,
+    )
+  }
+
+  async getComments({
+    page,
+    size,
+    filter = {},
+  }: {
+    page: number
+    size: number
+    filter?: CommentFindFilter
+  }) {
+    const normalizedFilter = this.normalizeListFilter(filter)
+    const queryList = await this.commentRepository.paginatedFind(
+      normalizedFilter,
+      page,
+      size,
+    )
+    await this.fillAndReplaceAvatarUrl(queryList.data)
+    const dataWithRef = await this.attachRef(queryList.data)
+    const dataWithParent = await this.attachParentPreview(dataWithRef)
+    const dataWithCountry = await this.enrichCommentsWithCountry(dataWithParent)
+    return { ...queryList, data: dataWithCountry }
+  }
+
+  async getReaderComments(readerId: string, page: number, size: number) {
+    return this.getComments({
+      page,
+      size,
+      filter: {
+        excludeJunk: true,
+        isDeleted: false,
+        readerId,
+      },
+    })
+  }
+
+  projectReaderComment(doc: CommentModel & { ref?: CommentRefSummary | null }) {
+    return {
+      createdAt: doc.createdAt,
+      id: String(doc.id),
+      refId: String(doc.refId),
+      refType: doc.refType,
+      source: doc.ref
+        ? {
+            categorySlug: doc.ref.category?.slug ?? null,
+            nid: doc.ref.nid ?? null,
+            slug: doc.ref.slug ?? null,
+          }
+        : null,
+      sourceTitle: doc.ref?.title ?? null,
+      text: doc.text,
+    }
+  }
+
+  async reportComment(
+    id: string,
+    reporter: { ip?: string; readerId?: string | null },
+  ): Promise<{ notified: boolean }> {
+    const comment = await this.commentRepository.findById(id)
+    if (!comment) {
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, { id })
+    }
+    const reporterKey = reporter.readerId || reporter.ip || 'anon'
+    const key = `${COMMENT_REPORT_KEY_PREFIX}${id}:${reporterKey}`
+    let acquired = true
+    try {
+      const stored = await this.redisService
+        .getClient()
+        .set(key, '1', 'EX', COMMENT_REPORT_TTL_SECONDS, 'NX')
+      acquired = stored === 'OK'
+    } catch (err) {
+      this.logger.debug(
+        `report dedupe write failed for ${key}: ${err instanceof Error ? err.message : err}`,
+      )
+    }
+    if (!acquired) return { notified: false }
+    await this.eventManager.broadcast(
+      BusinessEvents.COMMENT_UPDATE,
+      { id, reported: true },
+      { scope: EventScope.TO_SYSTEM_ADMIN },
+    )
+    return { notified: true }
+  }
+
+  async reportAndBlockComment(
+    id: string,
+    reporter: { ip?: string; readerId: string },
+  ): Promise<{ blockedReaderId: string; notified: boolean }> {
+    const comment = await this.commentRepository.findById(id)
+    if (!comment) {
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, { id })
+    }
+    if (!comment.readerId || comment.readerId === reporter.readerId) {
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'This comment author cannot be blocked.',
+      })
+    }
+
+    const { notified } = await this.reportComment(id, reporter)
+    await this.commentRepository.blockReader(
+      reporter.readerId,
+      comment.readerId,
+    )
+    return { blockedReaderId: comment.readerId, notified }
+  }
+
+  /**
+   * Translate the legacy numeric `state` parameter to its `tab` equivalent
+   * when callers pass `state` without `tab` (spec §6.2). Emits a one-shot
+   * deprecation warning per process so logs do not flood under a busy admin
+   * page. `tab` is the source of truth — when both are supplied, `state` is
+   * dropped before the repository sees it.
+   */
+  private normalizeListFilter(filter: CommentFindFilter): CommentFindFilter {
+    if (filter.tab) {
+      const { state: _ignored, ...rest } = filter
+      void _ignored
+      return rest
+    }
+    if (filter.state !== undefined && filter.state in DEFAULT_STATE_TO_TAB) {
+      if (!this.deprecatedStateWarned) {
+        this.deprecatedStateWarned = true
+        console.warn(
+          '[comment] GET /comments?state= is deprecated; use ?tab= instead.',
+        )
+      }
+      const { state, ...rest } = filter
+      return { ...rest, tab: DEFAULT_STATE_TO_TAB[state as number] }
+    }
+    return filter
+  }
+
+  /**
+   * Tab counts (spec §6.1). Redis-backed 30s cache keyed on `(refType, refId)`.
+   * Mutations that touch `state`/`is_deleted`/`is_whispers` invalidate the
+   * whole `comment:tab-counts:*` namespace via `invalidateTabCountsCache`.
+   */
+  async getTabCounts(
+    filter: CommentTabCountsFilter = {},
+  ): Promise<CommentTabCounts> {
+    const key = this.tabCountsKey(filter)
+    const cached = await this.readJsonCache<CommentTabCounts>(key)
+    if (cached) return cached
+
+    const counts = await this.commentRepository.getTabCounts(filter)
+    await this.writeJsonCache(key, counts, TAB_COUNTS_TTL_SECONDS)
+    return counts
+  }
+
+  /**
+   * Author activity panel (spec §6.3). Redis-backed 5min cache keyed on
+   * `(mail, ip)`. Threat level is derived from the same query so the
+   * sidebar renders without follow-up round trips.
+   */
+  async getAuthorActivity(
+    filter: AuthorActivityFilter,
+  ): Promise<AuthorActivity> {
+    if (!filter.mail && !filter.ip) {
+      throw createAppException(AppErrorCode.VALIDATION_FAILED, {
+        issues: [
           {
-            path: 'ref',
-            // categoryId for post
-            // content for recently
-            select: 'title _id slug nid categoryId content',
+            code: 'custom',
+            path: ['mail'],
+            message: 'At least one of mail or ip must be provided',
           },
         ],
-        sort: { created: -1 },
-        autopopulate: false,
+      })
+    }
+    const key = this.authorActivityKey(filter)
+    const cached = await this.readJsonCache<AuthorActivity>(key)
+    if (cached) return cached
+
+    const raw = await this.commentRepository.getAuthorActivity(filter)
+    const threat = this.computeThreatLevel(raw)
+    const result: AuthorActivity = {
+      totalCount: raw.totalCount,
+      firstSeenAt: raw.firstSeenAt,
+      lastSeenAt: raw.lastSeenAt,
+      items: raw.items,
+      threatLevel: threat.level,
+      ...(threat.reason ? { threatReason: threat.reason } : {}),
+    }
+    await this.writeJsonCache(key, result, AUTHOR_ACTIVITY_TTL_SECONDS)
+    return result
+  }
+
+  /**
+   * Batch country-code enrichment (spec §6.4). Unique IPs are resolved via
+   * `CommentCountryService` (Redis-cached per-IP for 30 days); a row's
+   * persisted `countryCode` is preferred when present so most reads stay
+   * lookup-free.
+   */
+  async enrichCommentsWithCountry<
+    T extends Pick<CommentRow, 'ip' | 'countryCode'>,
+  >(rows: T[]): Promise<T[]> {
+    if (rows.length === 0) return rows
+    const missingIps = new Set<string>()
+    for (const row of rows) {
+      if (!row.countryCode && row.ip) missingIps.add(row.ip)
+    }
+    if (missingIps.size === 0) return rows
+
+    const resolved = new Map<string, string | null>()
+    await Promise.all(
+      [...missingIps].map(async (ip) => {
+        const code = await this.commentCountryService.lookupCountryCode(ip)
+        resolved.set(ip, code)
+      }),
+    )
+
+    for (const row of rows) {
+      if (!row.countryCode && row.ip) {
+        const code = resolved.get(row.ip)
+        if (code) row.countryCode = code
+      }
+    }
+    return rows
+  }
+
+  private computeThreatLevel(raw: {
+    totalCount: number
+    junkInLast30Days: number
+    sameNetJunkInLast7Days: number
+    items: ReadonlyArray<{ state: number }>
+  }): { level: AuthorThreatLevel; reason?: string } {
+    const everJunk = raw.items.some((item) => item.state === CommentState.Junk)
+    if (everJunk) {
+      return {
+        level: 'risk',
+        reason: 'Author has been flagged as junk before.',
+      }
+    }
+    if (raw.sameNetJunkInLast7Days >= 3) {
+      return {
+        level: 'risk',
+        reason: 'Same /24 IP block had 3+ junk comments in the last 7 days.',
+      }
+    }
+    if (raw.junkInLast30Days === 0 && raw.totalCount >= 3) {
+      return {
+        level: 'trusted',
+        reason: 'No junk in the last 30 days and 3+ historical comments.',
+      }
+    }
+    return { level: 'neutral' }
+  }
+
+  private tabCountsKey(filter: CommentTabCountsFilter): string {
+    const refType = filter.refType ?? '*'
+    const refId = filter.refId ?? '*'
+    return `${TAB_COUNTS_KEY_PREFIX}${refType}:${refId}`
+  }
+
+  private authorActivityKey(filter: AuthorActivityFilter): string {
+    const mail = filter.mail ?? ''
+    const ip = filter.ip ?? ''
+    return `${AUTHOR_ACTIVITY_KEY_PREFIX}${mail}:${ip}`
+  }
+
+  /**
+   * Invalidate every cached tab-counts entry. Called from every mutation
+   * that flips `state`, `is_deleted`, or `is_whispers` (spec §6.1). A full
+   * pattern delete is cheaper than tracking per-ref cache fanout because
+   * each entry is 6 ints with a 30s TTL.
+   */
+  async invalidateTabCountsCache(): Promise<void> {
+    try {
+      await this.redisService.deleteKeysByPattern(`${TAB_COUNTS_KEY_PREFIX}*`)
+    } catch (err) {
+      this.logger.warn(
+        `tab-counts cache invalidation failed: ${err instanceof Error ? err.message : err}`,
+      )
+    }
+  }
+
+  private async readJsonCache<T>(key: string): Promise<T | null> {
+    try {
+      const client = this.redisService.getClient()
+      const raw = await client.get(key)
+      if (!raw) return null
+      return JSON.parse(raw, this.reviveDate) as T
+    } catch (err) {
+      this.logger.debug(
+        `cache read failed for ${key}: ${err instanceof Error ? err.message : err}`,
+      )
+      return null
+    }
+  }
+
+  private async writeJsonCache<T>(
+    key: string,
+    value: T,
+    ttlSeconds: number,
+  ): Promise<void> {
+    try {
+      const client = this.redisService.getClient()
+      await client.set(key, JSON.stringify(value), 'EX', ttlSeconds)
+    } catch (err) {
+      this.logger.debug(
+        `cache write failed for ${key}: ${err instanceof Error ? err.message : err}`,
+      )
+    }
+  }
+
+  // Restore Date instances on cache read so callers (e.g. the controller's
+  // view layer) see the same wall-clock value they originally serialized.
+  private reviveDate(_key: string, value: unknown): unknown {
+    if (
+      typeof value === 'string' &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)
+    ) {
+      const parsed = new Date(value)
+      if (!Number.isNaN(parsed.getTime())) return parsed
+    }
+    return value
+  }
+
+  async getSourceCandidates(options: {
+    refType?: CommentRefType
+    search?: string
+    size?: number
+  }): Promise<CommentSourceCandidateSummary[]> {
+    const candidates = await this.commentRepository.findSourceCandidates({
+      refType: options.refType,
+      size: options.search ? 100 : options.size,
+    })
+    const rows = candidates.map((candidate) => ({
+      id: `${candidate.refType}:${candidate.refId}`,
+      refType: candidate.refType,
+      refId: candidate.refId,
+      count: candidate.count,
+      latestCommentAt: candidate.latestCommentAt,
+    }))
+    const withRef = await this.attachRef(rows)
+    const search = options.search?.trim().toLowerCase()
+
+    return withRef
+      .flatMap((row) => {
+        if (!row.ref) return []
+        const title = row.ref.title ?? ''
+        if (search && !title.toLowerCase().includes(search)) return []
+        return [
+          {
+            ...row.ref,
+            commentCount: row.count,
+            latestCommentAt: row.latestCommentAt,
+          },
+        ]
+      })
+      .slice(0, options.size ?? 30)
+  }
+
+  async getAdminThreadForComment(id: string) {
+    const selected = await this.commentRepository.findById(id)
+    if (!selected) return null
+    const rootId = String(selected.rootCommentId ?? selected.id)
+    const thread = await this.commentRepository.findAdminThreadByRoot(rootId)
+    const withRef = await this.attachRef(thread)
+    const withParents = await this.attachParentPreview(withRef)
+    await this.fillAndReplaceAvatarUrl(withParents as CommentModel[])
+
+    const root =
+      withParents.find((comment) => String(comment.id) === rootId) ?? null
+    const currentFromThread =
+      withParents.find((comment) => String(comment.id) === id) ?? null
+    const current = currentFromThread ?? selected
+
+    return {
+      currentCommentId: String(id),
+      rootCommentId: rootId,
+      root,
+      thread: withParents,
+      current,
+      ref: root?.ref ?? currentFromThread?.ref ?? null,
+    }
+  }
+
+  async getCommentsByRefId(
+    refId: string,
+    {
+      page,
+      size,
+      isAuthenticated,
+      commentShouldAudit,
+      hasAnchor = false,
+      sort = 'pinned',
+      around,
+      readerId,
+    }: {
+      page: number
+      size: number
+      isAuthenticated: boolean
+      commentShouldAudit: boolean
+      hasAnchor?: boolean
+      sort?: 'pinned' | 'newest' | 'oldest'
+      around?: string
+      readerId?: string | null
+    },
+  ) {
+    const blockedReaderIds = readerId
+      ? await this.commentRepository.findBlockedReaderIds(readerId)
+      : []
+    const result = await this.commentRepository.findRootThreadsByRef(refId, {
+      blockedReaderIds,
+      page,
+      size,
+      isAuthenticated,
+      commentShouldAudit,
+      hasAnchor,
+      sort,
+      around,
+    })
+
+    const rootIds = result.data.map((comment) => comment.id)
+    const replies = await this.commentRepository.findVisibleRepliesForRoots(
+      rootIds,
+      {
+        blockedReaderIds,
+        isAuthenticated,
+        commentShouldAudit,
+      },
+    )
+    const repliesByRootId = new Map<string, CommentModel[]>()
+    for (const reply of replies) {
+      const rootId = reply.rootCommentId
+      if (!rootId) continue
+      const current = repliesByRootId.get(rootId) ?? []
+      current.push(reply as CommentModel)
+      repliesByRootId.set(rootId, current)
+    }
+
+    const dataWithRef = await this.attachRef(result.data)
+    const data = dataWithRef.map((comment) => {
+      const threadReplies = repliesByRootId.get(comment.id) ?? []
+      const { replies, replyWindow } = this.buildReplyWindow(threadReplies)
+      return {
+        ...comment,
+        rootCommentId: comment.rootCommentId ?? null,
+        parentCommentId: comment.parentCommentId ?? null,
+        replies,
+        replyWindow,
+      }
+    })
+
+    await this.fillAndReplaceAvatarUrl([
+      ...(data as CommentModel[]),
+      ...data.flatMap((comment) => comment.replies),
+    ])
+    return {
+      ...result,
+      data,
+    }
+  }
+
+  async getThreadReplies(
+    rootCommentId: string,
+    {
+      cursor,
+      size = COMMENT_THREAD_BATCH_SIZE,
+      isAuthenticated,
+      commentShouldAudit,
+      readerId,
+    }: {
+      cursor?: string
+      size?: number
+      isAuthenticated: boolean
+      commentShouldAudit: boolean
+      readerId?: string | null
+    },
+  ) {
+    const blockedReaderIds = readerId
+      ? await this.commentRepository.findBlockedReaderIds(readerId)
+      : []
+    const replies = await this.commentRepository.findVisibleRepliesForRoot(
+      rootCommentId,
+      {
+        blockedReaderIds,
+        isAuthenticated,
+        commentShouldAudit,
       },
     )
 
-    // 过滤脏数据
-    this.cleanDirtyData(queryList.docs)
+    const total = replies.length
+    if (total <= COMMENT_REPLY_THRESHOLD) {
+      await this.fillAndReplaceAvatarUrl(replies)
+      return { replies, remaining: 0, done: true }
+    }
 
-    await this.fillAndReplaceAvatarUrl(queryList.docs)
+    const headSize = Math.min(COMMENT_REPLY_EDGE_SIZE, total)
+    const tailStart = Math.max(headSize, total - COMMENT_REPLY_EDGE_SIZE)
+    const middleStart = headSize
+    const middleEnd = tailStart
 
-    return queryList
-  }
+    let startIndex = middleStart
+    if (cursor) {
+      const cursorIndex = replies.findIndex((reply) => reply.id === cursor)
+      if (cursorIndex >= middleStart) startIndex = cursorIndex + 1
+    }
 
-  cleanDirtyData(docs: CommentModel[]) {
-    for (const doc of docs) {
-      if (!doc.children || doc.children.length === 0) {
-        continue
-      }
+    const nextReplies = replies.slice(
+      startIndex,
+      Math.min(startIndex + size, middleEnd),
+    )
+    await this.fillAndReplaceAvatarUrl(nextReplies)
 
-      const nextChildren = [] as any[]
+    const consumedEnd = startIndex + nextReplies.length
 
-      for (const child of doc.children) {
-        if (isObjectIdOrHexString(child)) {
-          this.logger.warn(`--> 检测到一条脏数据：${doc.id}.child: ${child}`)
-          continue
-        }
-        nextChildren.push(child)
-
-        if ((child as CommentModel).children) {
-          this.cleanDirtyData((child as CommentModel).children as any[])
-        }
-      }
-
-      doc.children = nextChildren
+    return {
+      replies: nextReplies,
+      nextCursor: nextReplies.at(-1)?.id,
+      remaining: Math.max(0, middleEnd - consumedEnd),
+      done: consumedEnd >= middleEnd,
     }
   }
 
-  async sendEmail(comment: CommentModel, type: CommentReplyMailType) {
-    const enable = await this.configs
-      .get('mailOptions')
-      .then((config) => config.enable)
-    if (!enable) {
-      return
-    }
-
-    const masterInfo = await this.userService.getMasterInfo()
-
-    const refType = comment.refType
-    const refModel = this.getModelByRefType(refType)
-    const refDoc = await refModel.findById(comment.ref)
-    const time = new Date(comment.created!)
-    const parent: CommentModel | null = await this.commentModel
-      .findOne({ _id: comment.parent })
-      .lean()
-
-    const parsedTime = `${time.getDate()}/${
-      time.getMonth() + 1
-    }/${time.getFullYear()}`
-
-    if (!refDoc || !masterInfo.mail) {
-      return
-    }
-
-    this.sendCommentNotificationMail({
-      to: type === CommentReplyMailType.Owner ? masterInfo.mail : parent!.mail,
-      type,
-      source: {
-        title: refType === CollectionRefTypes.Recently ? '速记' : refDoc.title,
-        text: comment.text,
-        author:
-          type === CommentReplyMailType.Guest ? parent!.author : comment.author,
-        master: masterInfo.name,
-        link: await this.resolveUrlByType(refType, refDoc).then(
-          (url) => `${url}#comments-${comment.id}`,
-        ),
-        time: parsedTime,
-        mail:
-          CommentReplyMailType.Owner === type ? comment.mail : masterInfo.mail,
-        ip: comment.ip || '',
-
-        aggregate: {
-          owner: masterInfo,
-          commentor: {
-            ...pick(comment, defaultCommentModelKeys),
-            created: new Date(comment.created!).toISOString(),
-            isWhispers: comment.isWhispers || false,
-          } as CommentModelRenderProps,
-          parent,
-          post: {
-            title: refDoc.title,
-            created: new Date(refDoc.created!).toISOString(),
-            id: refDoc.id!,
-            modified: refDoc.modified
-              ? new Date(refDoc.modified!).toISOString()
-              : null,
-            text: refDoc.text,
-          },
+  private buildReplyWindow(replies: CommentModel[]) {
+    if (replies.length <= COMMENT_REPLY_THRESHOLD) {
+      return {
+        replies,
+        replyWindow: {
+          total: replies.length,
+          returned: replies.length,
+          threshold: COMMENT_REPLY_THRESHOLD,
+          hasHidden: false,
+          hiddenCount: 0,
         },
+      }
+    }
+
+    const head = replies.slice(0, COMMENT_REPLY_EDGE_SIZE)
+    const tail = replies.slice(-COMMENT_REPLY_EDGE_SIZE)
+    const selected = [...head]
+
+    const seen = new Set(head.map((reply) => reply.id))
+    for (const reply of tail) {
+      if (!seen.has(reply.id)) selected.push(reply)
+    }
+
+    return {
+      replies: selected,
+      replyWindow: {
+        total: replies.length,
+        returned: selected.length,
+        threshold: COMMENT_REPLY_THRESHOLD,
+        hasHidden: true,
+        hiddenCount: replies.length - selected.length,
+        nextCursor: head.at(-1)?.id,
       },
-    })
-  }
-
-  async resolveUrlByType(type: CollectionRefTypes, model: any) {
-    const {
-      url: { webUrl: base },
-    } = await this.configs.waitForConfigReady()
-    switch (type) {
-      case CollectionRefTypes.Note: {
-        return new URL(`/notes/${model.nid}`, base).toString()
-      }
-      case CollectionRefTypes.Page: {
-        return new URL(`/${model.slug}`, base).toString()
-      }
-      case CollectionRefTypes.Post: {
-        return new URL(
-          `/posts/${model.category.slug}/${model.slug}`,
-          base,
-        ).toString()
-      }
-      case CollectionRefTypes.Recently: {
-        return new URL(`/recently/${model._id}`, base).toString()
-      }
     }
   }
 
-  async appendIpLocation(id: string, ip: string) {
-    if (!ip) {
-      return
+  collectThreadReaderIds(
+    comments: Array<CommentModel & { replies?: CommentModel[] }>,
+  ) {
+    const readerIds = new Set<string>()
+    const collect = (comment: CommentModel & { replies?: CommentModel[] }) => {
+      if (comment.readerId) readerIds.add(comment.readerId)
+      comment.replies?.forEach((reply) => collect(reply as any))
     }
-    const { recordIpLocation } = await this.configsService.get('commentOptions')
-
-    if (!recordIpLocation) {
-      return
-    }
-
-    const model = this.commentModel.findById(id).lean()
-    if (!model) {
-      return
-    }
-
-    const fnModel = (await this.serverlessService.model
-      .findOne({
-        name: 'ip',
-        reference: 'built-in',
-        type: SnippetType.Function,
-      })
-      .select('+secret')
-      .lean({
-        getters: true,
-      })) as SnippetModel
-
-    if (!fnModel) {
-      this.logger.error('[Serverless Fn] ip query function is missing.')
-      return model
-    }
-
-    const result =
-      await this.serverlessService.injectContextIntoServerlessFunctionAndCall(
-        fnModel,
-        {
-          req: {
-            query: { ip },
-          },
-          res: createMockedContextResponse({} as any),
-        } as any,
-      )
-
-    const location =
-      `${result.countryName || ''}${
-        result.regionName && result.regionName !== result.cityName
-          ? String(result.regionName)
-          : ''
-      }${result.cityName ? String(result.cityName) : ''}` || undefined
-
-    if (location) await this.commentModel.updateOne({ _id: id }, { location })
+    comments.forEach((comment) => collect(comment))
+    return [...readerIds]
   }
 
   async fillAndReplaceAvatarUrl(comments: CommentModel[]) {
-    const master = await this.userService.getMaster()
-
-    comments.forEach(function process(comment) {
-      if (typeof comment == 'string') {
-        return
-      }
-      // 如果是 author 是站长，就用站长自己设定的头像替换
-      if (comment.author === master.name) {
-        comment.avatar = master.avatar || comment.avatar
-      }
-
-      // 如果不存在头像就
-      if (!comment.avatar) {
-        comment.avatar = getAvatar(comment.mail)
-      }
-
-      if (comment.children?.length) {
-        comment.children.forEach((child) => {
-          process(child as CommentModel)
-        })
-      }
-
-      return comment
+    const owner = await this.ownerService.getOwner()
+    const readerIds = new Set<string>()
+    comments.forEach(function collect(comment) {
+      if (typeof comment == 'string') return
+      if (comment.readerId) readerIds.add(comment.readerId)
+      ;(
+        comment as CommentModel & { replies?: CommentModel[] }
+      ).replies?.forEach((child) => collect(child as CommentModel))
     })
 
+    const readers = readerIds.size
+      ? await this.readerService.findReaderInIds([...readerIds])
+      : []
+    const readerMap = new Map<string, ReaderModel>()
+    readers.forEach((reader) => {
+      const id = (reader as any).id || (reader as any).id?.toString?.()
+      if (id) readerMap.set(id, reader)
+    })
+
+    comments.forEach(function process(comment) {
+      if (typeof comment == 'string') return
+      const reader = comment.readerId ? readerMap.get(comment.readerId) : null
+      if (reader) {
+        const isOwner = reader.role === 'owner'
+        // Reader.name may be null (better-auth users created via OAuth without
+        // a profile name, manual signup with empty name, etc). Walk a robust
+        // fallback chain so admin notifications never render "null: <text>".
+        const readerDisplay =
+          reader.name ||
+          reader.displayUsername ||
+          reader.username ||
+          (reader as any).handle ||
+          (reader.email ? reader.email.split('@')[0] : null)
+        comment.author =
+          isOwner && owner.name
+            ? owner.name
+            : readerDisplay || comment.author || 'Anonymous'
+        comment.avatar =
+          (isOwner ? owner.avatar : undefined) ||
+          reader.image ||
+          getAvatar(reader.email ?? undefined)
+      }
+      if (comment.author === owner.name) {
+        comment.avatar = owner.avatar || comment.avatar
+      }
+      if (!comment.avatar) comment.avatar = getAvatar(comment.mail)
+      ;(
+        comment as CommentModel & { replies?: CommentModel[] }
+      ).replies?.forEach((child) => process(child as CommentModel))
+    })
     return comments
   }
 
-  async sendCommentNotificationMail({
-    to,
-    source,
-    type,
-  }: {
-    to: string
-    source: Pick<
-      CommentEmailTemplateRenderProps,
-      keyof CommentEmailTemplateRenderProps
-    >
-    type: CommentReplyMailType
-  }) {
-    const { seo, mailOptions } = await this.configsService.waitForConfigReady()
-    const { from, user } = mailOptions
-    const sendfrom = `"${seo.title || 'Mx Space'}" <${from || user}>`
-
-    source.ip ??= ''
-    if (type === CommentReplyMailType.Guest) {
-      const options = {
-        from: sendfrom,
-        subject: `[${seo.title || 'Mx Space'}] 主人给你了新的回复呐`,
-        to,
-        html: render(
-          (await this.mailService.readTemplate(type)) as string,
-          source,
-        ),
-      }
-      if (isDev) {
-        // @ts-ignore
-        delete options.html
-        Object.assign(options, { source })
-        this.logger.log(options)
-        return
-      }
-      await this.mailService.send(options)
-    } else {
-      const options = {
-        from: sendfrom,
-        subject: `[${seo.title || 'Mx Space'}] 有新回复了耶~`,
-        to,
-        html: render(
-          (await this.mailService.readTemplate(type)) as string,
-          source,
-        ),
-      }
-      if (isDev) {
-        // @ts-ignore
-        delete options.html
-        Object.assign(options, { source })
-        this.logger.log(options)
-        return
-      }
-      await this.mailService.send(options)
+  async updateComment(
+    id: string,
+    patch: Partial<{
+      text: string
+      state: number
+      pin: boolean
+      isDeleted: boolean
+      isWhispers: boolean
+      meta: string | null
+      anchor: Record<string, unknown> | null
+      editedAt: Date | null
+      location: string | null
+    }>,
+  ) {
+    const result = await this.commentRepository.update(id, patch)
+    if (
+      patch.state !== undefined ||
+      patch.isDeleted !== undefined ||
+      patch.isWhispers !== undefined
+    ) {
+      await this.invalidateTabCountsCache()
     }
+    return result
   }
 
-  // push comment
-  @OnEvent(BusinessEvents.COMMENT_CREATE)
-  async pushCommentEvent(comment: CommentModel) {
-    const { enable, enableComment } =
-      await this.configsService.get('barkOptions')
-    if (!enable) {
-      return
-    }
-    if (!enableComment) {
-      return
-    }
-    const master = await this.userService.getMaster()
-    if (comment.author == master.name && comment.author == master.username) {
-      return
-    }
-    const { adminUrl } = await this.configsService.get('url')
+  async clearPinForRefOfComment(id: string) {
+    const comment = await this.commentRepository.findById(id)
+    if (!comment) return
+    const comments = await this.commentRepository.paginatedFind(
+      { refId: comment.refId, refType: comment.refType },
+      1,
+      50,
+    )
+    await Promise.all(
+      comments.data.map((item) =>
+        this.commentRepository.update(item.id, { pin: false }),
+      ),
+    )
+  }
 
-    await this.barkService.push({
-      title: '收到一条新评论',
-      body: `${comment.author} 评论了你的${
-        comment.refType === CollectionRefTypes.Recently ? '速记' : '文章'
-      }：${comment.text}`,
-      icon: comment.avatar,
-      url: `${adminUrl}#/comments`,
-    })
+  async updateStateBulk(ids: string[], state: number) {
+    const affected = await this.commentRepository.updateStateBulk(ids, state)
+    if (affected > 0) await this.invalidateTabCountsCache()
+    return affected
+  }
+
+  async updateStateByFilter(filter: CommentFindFilter, state: number) {
+    const affected = await this.commentRepository.updateStateByFilter(
+      this.normalizeListFilter(filter),
+      state,
+    )
+    if (affected > 0) await this.invalidateTabCountsCache()
+    return affected
+  }
+
+  async findByFilter(filter: CommentFindFilter) {
+    return this.commentRepository.findByFilter(this.normalizeListFilter(filter))
+  }
+
+  @OnEvent(BusinessEvents.POST_UPDATE)
+  async handlePostUpdate(payload: { id?: string }) {
+    void payload
+  }
+
+  @OnEvent(BusinessEvents.NOTE_UPDATE)
+  async handleNoteUpdate(payload: { id?: string }) {
+    void payload
+  }
+
+  @OnEvent(BusinessEvents.PAGE_UPDATE)
+  async handlePageUpdate(payload: { id?: string }) {
+    void payload
   }
 
   async editComment(id: string, text: string) {
-    const comment = await this.commentModel.findById(id).lean()
-    if (!comment) {
-      throw new CannotFindException()
-    }
-    await this.commentModel.updateOne(
-      { _id: id },
-      { text, editedAt: new Date() },
-    )
+    const comment = await this.commentRepository.findById(id)
+    if (!comment) throw createAppException(AppErrorCode.NOT_FOUND)
+    if (comment.isDeleted)
+      throw createAppException(AppErrorCode.NO_CONTENT_MODIFIABLE)
+    await this.commentRepository.update(id, { text, editedAt: new Date() })
     await this.eventManager.broadcast(
       BusinessEvents.COMMENT_UPDATE,
       { id, text },

@@ -1,8 +1,8 @@
 import { dbHelper } from 'test/helper/db-mock.helper'
 import { defineProvider } from 'test/helper/defineProvider'
 
-import { CommentModel } from '~/modules/comment/comment.model'
 import { CommentService } from '~/modules/comment/comment.service'
+import type { CommentModel } from '~/modules/comment/comment.types'
 
 export const commentProvider = defineProvider({
   provide: CommentService,

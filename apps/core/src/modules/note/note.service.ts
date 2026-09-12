@@ -1,288 +1,512 @@
-import { isDefined, isMongoId } from 'class-validator'
-import dayjs from 'dayjs'
-import { debounce, omit } from 'lodash'
-import type { DocumentType } from '@typegoose/typegoose'
-import type { FilterQuery, PaginateOptions } from 'mongoose'
+import {
+  BadRequestException,
+  forwardRef,
+  Inject,
+  Injectable,
+} from '@nestjs/common'
+import { isNotNil } from 'es-toolkit'
+import { debounce, omit } from 'es-toolkit/compat'
 
-import { forwardRef, Inject, Injectable } from '@nestjs/common'
-
-import { CannotFindException } from '~/common/exceptions/cant-find.exception'
-import { NoContentCanBeModifiedException } from '~/common/exceptions/no-content-canbe-modified.exception'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { ArticleTypeEnum } from '~/constants/article.constant'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { CollectionRefTypes } from '~/constants/db.constant'
 import { EventBusEvents } from '~/constants/event-bus.constant'
+import type { MarkdownToLexicalMigrationDescriptor } from '~/modules/content-migration/content-migration.schema'
+import { ContentMigrationCommitService } from '~/modules/content-migration/content-migration-commit.service'
+import { FileReferenceType } from '~/modules/file/file-reference.enum'
+import { FileReferenceService } from '~/modules/file/file-reference.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
 import { ImageService } from '~/processors/helper/helper.image.service'
-import { TextMacroService } from '~/processors/helper/helper.macro.service'
-import { InjectModel } from '~/transformers/model.transformer'
+import { LexicalService } from '~/processors/helper/helper.lexical.service'
+import type { EntityId } from '~/shared/id/entity-id'
+import { ContentFormat } from '~/shared/types/content-format.type'
+import { isNoteSecret } from '~/utils/biz.util'
+import { contentIdentityChanged, isLexical } from '~/utils/content.util'
 import { scheduleManager } from '~/utils/schedule.util'
+import { normalizeSlug } from '~/utils/slug.util'
 import { getLessThanNow } from '~/utils/time.util'
 
-import { getArticleIdFromRoomName } from '../activity/activity.util'
+import { AiSlugBackfillService } from '../ai/ai-writer/ai-slug-backfill.service'
 import { CommentService } from '../comment/comment.service'
-import { NoteModel } from './note.model'
+import { DraftRefType } from '../draft/draft.enum'
+import { DraftService } from '../draft/draft.service'
+import { EnrichmentService } from '../enrichment/enrichment.service'
+import { SlugTrackerService } from '../slug-tracker/slug-tracker.service'
+import { NoteRepository } from './note.repository'
+import {
+  type Coordinate,
+  NOTE_PROTECTED_KEYS,
+  type NoteCreateDocument,
+  type NoteListFilter,
+  type NoteModel,
+  type NoteRow,
+  type NoteSortOptions,
+} from './note.types'
 
 @Injectable()
 export class NoteService {
   constructor(
-    @InjectModel(NoteModel)
-    private readonly noteModel: MongooseModel<NoteModel>,
+    private readonly noteRepository: NoteRepository,
     private readonly imageService: ImageService,
+    private readonly fileReferenceService: FileReferenceService,
     private readonly eventManager: EventManagerService,
+    private readonly lexicalService: LexicalService,
+    private readonly contentMigrationCommitService: ContentMigrationCommitService,
+    private readonly slugTrackerService: SlugTrackerService,
+    private readonly aiSlugBackfillService: AiSlugBackfillService,
+    private readonly enrichmentService: EnrichmentService,
     @Inject(forwardRef(() => CommentService))
     private readonly commentService: CommentService,
-
-    private readonly textMacrosService: TextMacroService,
+    @Inject(forwardRef(() => DraftService))
+    private readonly draftService: DraftService,
   ) {}
 
-  public get model() {
-    return this.noteModel
+  public get repository() {
+    return this.noteRepository
   }
 
-  public readonly publicNoteQueryCondition = {
-    hide: false,
-    $and: [
-      {
-        $or: [
-          {
-            password: '',
-          },
-          {
-            password: undefined,
-          },
-        ],
-      },
-      {
-        $or: [
-          {
-            secret: undefined,
-          },
-          {
-            secret: {
-              $lt: new Date(),
-            },
-          },
-        ],
-      },
-    ],
-  }
+  public readonly publicNoteQueryCondition = { isPublished: true }
 
-  public checkNoteIsSecret(note: NoteModel) {
-    if (!note.publicAt) {
-      return false
+  private normalizeCoordinates(coordinates: Coordinate | null | undefined) {
+    if (!coordinates) return coordinates
+    if (
+      typeof coordinates.latitude !== 'number' ||
+      typeof coordinates.longitude !== 'number'
+    ) {
+      return null
     }
-    const isSecret = dayjs(note.publicAt).isAfter(new Date())
+    return {
+      latitude: coordinates.latitude,
+      longitude: coordinates.longitude,
+    }
+  }
 
-    return isSecret
+  public checkNoteIsSecret(note: { publicAt?: Date | null }) {
+    return isNoteSecret(note)
+  }
+
+  private normalizeSlug(slug?: string | null) {
+    return normalizeSlug(slug)
+  }
+
+  private getDateRange(year: number, month: number, day: number) {
+    const start = new Date(Date.UTC(year, month - 1, day))
+    const end = new Date(Date.UTC(year, month - 1, day + 1))
+    return { start, end }
+  }
+
+  private isDateWithinRange(
+    date: Date | string,
+    year: number,
+    month: number,
+    day: number,
+  ) {
+    const { start, end } = this.getDateRange(year, month, day)
+    const value = new Date(date)
+    return value >= start && value < end
+  }
+
+  public buildSeoPath(note: { createdAt?: Date | null; slug?: string | null }) {
+    const normalizedSlug = this.normalizeSlug(note.slug ?? undefined)
+    if (!normalizedSlug || !note.createdAt) return null
+    const date = new Date(note.createdAt)
+    return `/notes/${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}/${normalizedSlug}`
+  }
+
+  public buildPublicPath(note: {
+    createdAt?: Date | null
+    slug?: string | null
+    nid: number
+  }) {
+    return this.buildSeoPath(note) ?? `/notes/${note.nid}`
+  }
+
+  private async ensureSlugAvailable(slug?: string, excludeId?: string) {
+    if (!slug) return
+    const existing = await this.noteRepository.findBySlug(slug)
+    if (!existing) return
+    if (excludeId && existing.id === excludeId) return
+    throw createAppException(AppErrorCode.SLUG_NOT_AVAILABLE)
+  }
+
+  private async trackSeoPathChanges(
+    oldDocument: { createdAt?: Date | null; slug?: string | null },
+    nextState: { createdAt?: Date | null; slug?: string | null },
+    targetId: string,
+  ) {
+    const oldPath = this.buildSeoPath(oldDocument)
+    const nextPath = this.buildSeoPath(nextState)
+    if (!oldPath || oldPath === nextPath) return
+    return this.slugTrackerService.createTracker(
+      oldPath,
+      ArticleTypeEnum.Note,
+      targetId,
+    )
+  }
+
+  async findById(id: string) {
+    return this.noteRepository.findById(id)
+  }
+
+  async findByNid(nid: number) {
+    return this.noteRepository.findByNid(nid)
+  }
+
+  async findBySlug(slug: string) {
+    return this.noteRepository.findBySlug(slug)
+  }
+
+  async findManyByIds(ids: string[]) {
+    return this.noteRepository.findManyByIds(ids)
+  }
+
+  async findRecent(
+    size: number,
+    options: { visibleOnly?: boolean; metaOnly?: boolean } = {},
+  ) {
+    return this.noteRepository.findRecent(size, options)
+  }
+
+  async findDistinctMoodsAndWeathers() {
+    return this.noteRepository.findDistinctMoodsAndWeathers()
+  }
+
+  async listPaginated(
+    page: number,
+    size: number,
+    options: { visibleOnly?: boolean } & NoteSortOptions & NoteListFilter = {},
+  ) {
+    const { visibleOnly, ...rest } = options
+    return visibleOnly
+      ? this.noteRepository.listVisible(page, size, rest)
+      : this.noteRepository.listAll(page, size, rest)
+  }
+
+  async count() {
+    return this.noteRepository.count()
+  }
+
+  async countVisible() {
+    return this.noteRepository.countVisible()
+  }
+
+  async findAdjacent(
+    direction: 'before' | 'after',
+    pivot: { nid: number },
+    options: { visibleOnly?: boolean } = {},
+  ) {
+    return this.noteRepository.findAdjacent(direction, pivot, options)
+  }
+
+  async findByCreatedWindow(
+    pivotDate: Date,
+    direction: 'before' | 'after',
+    limit: number,
+    options: {
+      visibleOnly?: boolean
+      excludeId?: EntityId | string
+    } = {},
+  ) {
+    return this.noteRepository.findByCreatedWindow(
+      pivotDate,
+      direction,
+      limit,
+      options,
+    )
+  }
+
+  async findOneByDateAndSlug(
+    year: number,
+    month: number,
+    day: number,
+    slug: string,
+    _options?: { includeLocation?: boolean },
+  ) {
+    const normalizedSlug = this.normalizeSlug(slug)
+    if (!normalizedSlug) throw createAppException(AppErrorCode.INVALID_SLUG)
+
+    const { start, end } = this.getDateRange(year, month, day)
+    const direct = await this.noteRepository.findOneByDateAndSlug(
+      start,
+      end,
+      normalizedSlug,
+    )
+    if (direct) return direct
+
+    const tracked = await this.slugTrackerService.findTrackerBySlug(
+      `/notes/${year}/${month}/${day}/${normalizedSlug}`,
+      ArticleTypeEnum.Note,
+    )
+    if (!tracked) return null
+
+    const trackedDocument = await this.findById(tracked.targetId)
+    if (!trackedDocument) return null
+    if (!this.isDateWithinRange(trackedDocument.createdAt, year, month, day)) {
+      return null
+    }
+    return trackedDocument
   }
 
   async getLatestNoteId() {
-    const note = await this.noteModel
-      .findOne()
-      .sort({
-        created: -1,
-      })
-      .lean()
-    if (!note) {
-      throw new CannotFindException()
-    }
-    return {
-      nid: note.nid,
-      id: note.id,
-    }
+    const note = await this.noteRepository.getLatestVisibleId()
+    if (!note) throw createAppException(AppErrorCode.NOT_FOUND)
+    return { nid: note.nid, id: note.id }
   }
-  async getLatestOne(
-    condition: FilterQuery<DocumentType<NoteModel>> = {},
-    projection: any = undefined,
-  ) {
-    const latest: NoteModel | null = await this.noteModel
-      .findOne(condition, projection)
-      .sort({
-        created: -1,
-      })
-      .lean({
-        getters: true,
-        autopopulate: true,
-      })
 
-    if (!latest) {
-      return null
+  async getLatestOne(condition: { isPublished?: boolean } = {}) {
+    if (condition.isPublished === true) {
+      return this.noteRepository.findLatestVisiblePair()
     }
-
-    latest.text = await this.textMacrosService.replaceTextMacro(
-      latest.text,
-      latest,
+    const [latest] = await this.findRecent(1, {
+      visibleOnly: false,
+    })
+    if (!latest) return null
+    const [next] = await this.findByCreatedWindow(
+      latest.createdAt,
+      'before',
+      1,
+      {
+        visibleOnly: false,
+      },
     )
-
-    // 是否存在上一条记录 (旧记录)
-    // 统一：next 为较老的记录  prev 为较新的记录
-    // FIXME may cause bug
-    const next = await this.noteModel
-      .findOne({
-        created: {
-          $lt: latest.created,
-        },
-      })
-      .sort({
-        created: -1,
-      })
-      .select('nid _id')
-      .lean()
-
-    return {
-      latest,
-      next,
-    }
+    return { latest, next }
   }
 
-  checkPasswordToAccess<T extends NoteModel>(
-    doc: T,
-    password?: string,
-  ): boolean {
-    const hasPassword = doc.password
-    if (!hasPassword) {
-      return true
-    }
-    if (!password) {
-      return false
-    }
-    const isValid = Object.is(password, doc.password)
-    return isValid
+  async checkPasswordToAccess(noteId: string, password?: string) {
+    const stored = await this.noteRepository.getPassword(noteId)
+    if (!stored) return true
+    if (!password) return false
+    return Object.is(password, stored)
   }
 
-  public async create(document: NoteModel) {
-    document.created = getLessThanNow(document.created)
+  public async create(document: NoteCreateDocument) {
+    this.lexicalService.normalizeContentForStorage(document)
+    const normalizedSlug = this.normalizeSlug(document.slug)
+    await this.ensureSlugAvailable(normalizedSlug)
+    if (normalizedSlug) document.slug = normalizedSlug
 
-    const note = await this.noteModel.create(document)
+    let note = await this.noteRepository.create({
+      title: document.title,
+      slug: normalizedSlug,
+      text: document.text,
+      content: document.content,
+      contentFormat: document.contentFormat ?? ContentFormat.Markdown,
+      images: document.images as unknown[],
+      meta: document.meta,
+      isPublished: document.isPublished,
+      password: document.password,
+      publicAt: document.publicAt,
+      mood: document.mood,
+      weather: document.weather,
+      bookmark: document.bookmark,
+      coordinates: this.normalizeCoordinates(document.coordinates),
+      location: document.location,
+      topicId: document.topicId as string | undefined,
+    })
+
+    const userSuppliedCreatedAt =
+      document.createdAt ?? (document as any).created
+    if (userSuppliedCreatedAt) {
+      const refreshed = await this.noteRepository.update(note.id, {
+        createdAt: getLessThanNow(userSuppliedCreatedAt),
+      })
+      if (refreshed) note = refreshed
+    }
+
     scheduleManager.schedule(async () => {
+      await this.fileReferenceService.activateReferences(
+        note,
+        note.id,
+        FileReferenceType.Note,
+      )
       await Promise.all([
         this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
           scope: EventScope.TO_SYSTEM,
         }),
-        this.eventManager.emit(BusinessEvents.NOTE_CREATE, note.toJSON(), {
-          scope: EventScope.TO_SYSTEM,
-        }),
-        this.imageService.saveImageDimensionsFromMarkdownText(
-          note.text,
-          note.images,
-          (images) => {
-            note.images = images
-            return note.save()
+        this.eventManager.emit(
+          BusinessEvents.NOTE_CREATE,
+          { id: note.id },
+          {
+            scope: note.isPublished
+              ? EventScope.TO_SYSTEM_VISITOR
+              : EventScope.TO_SYSTEM,
           },
         ),
-        note.hide || note.password || this.checkNoteIsSecret(note)
-          ? null
-          : this.eventManager.broadcast(
-              BusinessEvents.NOTE_CREATE,
-              {
-                ...note.toJSON(),
-                text: await this.textMacrosService.replaceTextMacro(
-                  note.text,
-                  note,
-                ),
-              },
-              {
-                scope: EventScope.TO_VISITOR,
-                gateway: {
-                  rooms: [getArticleIdFromRoomName(note.id)],
-                },
-              },
-            ),
+        !normalizedSlug &&
+          this.aiSlugBackfillService
+            .createBackfillTaskForNotes([note.id])
+            .catch(() => undefined),
+        !isLexical(note) &&
+          this.imageService.saveImageDimensionsFromMarkdownText(
+            note.text,
+            note.images,
+            async (images) => {
+              await this.noteRepository.setImages(note.id, images)
+            },
+          ),
       ])
     })
+
+    this.enrichmentService.scheduleDocPrefetch(note)
 
     return note
   }
 
-  public async updateById(id: string, data: Partial<NoteModel>) {
-    const updatedData = Object.assign(
-      {},
-      omit(data, NoteModel.protectedKeys),
-      data.created
-        ? {
-            created: getLessThanNow(data.created),
-          }
-        : {},
+  public async updateById(
+    id: string,
+    data: Partial<NoteModel> & {
+      migration?: MarkdownToLexicalMigrationDescriptor
+      migrationBranchId?: string
+    },
+  ) {
+    this.lexicalService.normalizeContentForStorage(data)
+    const oldDoc = await this.findById(id)
+    if (!oldDoc) throw createAppException(AppErrorCode.NO_CONTENT_MODIFIABLE)
+
+    const { migration, migrationBranchId } = data
+    const isMarkdownToLexical =
+      oldDoc.contentFormat === ContentFormat.Markdown &&
+      data.contentFormat === ContentFormat.Lexical
+    if (
+      oldDoc.contentFormat === ContentFormat.Lexical &&
+      data.contentFormat === ContentFormat.Markdown
+    ) {
+      throw new BadRequestException(
+        'Published Lexical content cannot be downgraded to Markdown',
+      )
+    }
+    if (isMarkdownToLexical && !migration) {
+      throw new BadRequestException(
+        'Markdown-to-Lexical writes require a migration descriptor',
+      )
+    }
+    if (migration && !isMarkdownToLexical) {
+      throw new BadRequestException(
+        'Migration descriptor is only valid for Markdown-to-Lexical writes',
+      )
+    }
+    const hasSlugInput = Object.prototype.hasOwnProperty.call(data, 'slug')
+    const normalizedSlug = hasSlugInput
+      ? this.normalizeSlug(data.slug ?? undefined)
+      : undefined
+    if (hasSlugInput && normalizedSlug && normalizedSlug !== oldDoc.slug) {
+      await this.ensureSlugAvailable(normalizedSlug, id)
+    }
+
+    const hasFieldChanged = (
+      ['mood', 'weather', 'meta', 'topicId', 'slug'] as const
+    ).some((key) => {
+      if (key === 'slug' && hasSlugInput) return normalizedSlug !== oldDoc.slug
+      return isNotNil(data[key]) && data[key] !== oldDoc[key]
+    })
+    const hasContentChanged = contentIdentityChanged(oldDoc, data)
+
+    const patch = omit(data, [...NOTE_PROTECTED_KEYS, 'slug'] as const)
+    const userSuppliedCreatedAt = data.createdAt ?? (data as any).created
+    const repositoryPatch = {
+      title: patch.title,
+      slug: hasSlugInput ? normalizedSlug : undefined,
+      text: patch.text,
+      content: patch.content,
+      contentFormat: patch.contentFormat,
+      images: patch.images as unknown[] | undefined,
+      meta: patch.meta,
+      isPublished: patch.isPublished,
+      password: patch.password,
+      publicAt: patch.publicAt,
+      mood: patch.mood,
+      weather: patch.weather,
+      bookmark: patch.bookmark,
+      coordinates: this.normalizeCoordinates(patch.coordinates),
+      location: patch.location,
+      topicId: patch.topicId as string | undefined,
+      createdAt: userSuppliedCreatedAt
+        ? getLessThanNow(userSuppliedCreatedAt)
+        : undefined,
+      modifiedAt: hasContentChanged || hasFieldChanged ? new Date() : undefined,
+    }
+    let updated
+    if (migration) {
+      if (!data.content || data.text === undefined) {
+        throw new BadRequestException(
+          'Lexical migration requires content and text',
+        )
+      }
+      await this.contentMigrationCommitService.commitMarkdownToLexical({
+        refType: DraftRefType.Note,
+        refId: id,
+        descriptor: migration,
+        branchId: migrationBranchId,
+        patch: repositoryPatch,
+        source: {
+          title: repositoryPatch.title ?? oldDoc.title,
+          text: data.text,
+          content: data.content,
+          contentFormat: ContentFormat.Lexical,
+          meta:
+            repositoryPatch.meta === undefined
+              ? oldDoc.meta
+              : repositoryPatch.meta,
+        },
+      })
+      updated = await this.noteRepository.findById(id)
+    } else {
+      updated = await this.noteRepository.update(id, repositoryPatch)
+    }
+    if (!updated) throw createAppException(AppErrorCode.NO_CONTENT_MODIFIABLE)
+
+    await this.trackSeoPathChanges(
+      oldDoc,
+      {
+        createdAt: userSuppliedCreatedAt ?? oldDoc.createdAt,
+        slug: hasSlugInput ? normalizedSlug : oldDoc.slug,
+      },
+      id,
     )
 
-    if (['title', 'text'].some((key) => isDefined(data[key]))) {
-      data.modified = new Date()
-    }
-
-    const updated = await this.noteModel
-      .findOneAndUpdate(
-        {
-          _id: id,
-        },
-        updatedData,
-        { new: true, timestamps: false },
-      )
-      .lean({
-        getters: true,
-        autopopulate: true,
-      })
-
-    if (!updated) {
-      throw new NoContentCanBeModifiedException()
-    }
-
     scheduleManager.schedule(async () => {
+      await this.fileReferenceService.updateReferencesForDocument(
+        updated,
+        updated.id,
+        FileReferenceType.Note,
+      )
       await Promise.all([
         this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
           scope: EventScope.TO_SYSTEM,
         }),
-        this.imageService.saveImageDimensionsFromMarkdownText(
-          updated.text,
-          updated.images,
-          (images) => {
-            return this.model
-              .updateOne(
-                {
-                  _id: id,
-                },
-                {
-                  $set: {
-                    images,
-                  },
-                },
-              )
-              .exec()
-          },
-        ),
+        !isLexical(updated) &&
+          this.imageService.saveImageDimensionsFromMarkdownText(
+            updated.text,
+            updated.images,
+            async (images) => {
+              await this.noteRepository.setImages(id, images)
+            },
+          ),
       ])
     })
 
-    await this.boardcaseNoteUpdateEvent(updated)
+    this.enrichmentService.scheduleDocPrefetch(updated)
 
+    await this.broadcastNoteUpdateEvent(updated, oldDoc.isPublished)
     return updated
   }
 
-  private boardcaseNoteUpdateEvent = debounce(
-    async (updated: NoteModel) => {
-      if (!updated) {
-        return
-      }
-      this.eventManager.broadcast(BusinessEvents.NOTE_UPDATE, updated, {
-        scope: EventScope.TO_SYSTEM,
-      })
-
-      if (updated.password || updated.hide || updated.publicAt) {
-        return
-      }
-      this.eventManager.broadcast(
-        BusinessEvents.NOTE_UPDATE,
+  private broadcastNoteUpdateEvent = debounce(
+    async (updated: NoteRow, wasPublished: boolean) => {
+      if (!updated) return
+      this.eventManager.emit(
+        wasPublished === updated.isPublished
+          ? BusinessEvents.NOTE_UPDATE
+          : updated.isPublished
+            ? BusinessEvents.NOTE_REPUBLISH
+            : BusinessEvents.NOTE_UNPUBLISH,
+        { id: updated.id },
         {
-          ...updated,
-          text: await this.textMacrosService.replaceTextMacro(
-            updated.text,
-            updated,
-          ),
-        },
-        {
-          scope: EventScope.TO_VISITOR,
-          // gateway: {
-          //   rooms: [getArticleIdFromRoomName(updated.id)],
-          // },
+          scope:
+            wasPublished || updated.isPublished
+              ? EventScope.TO_SYSTEM_VISITOR
+              : EventScope.TO_SYSTEM,
         },
       )
     },
@@ -291,76 +515,63 @@ export class NoteService {
   )
 
   async deleteById(id: string) {
-    const doc = await this.noteModel.findById(id)
-    if (!doc) {
-      return
-    }
-
+    const doc = await this.findById(id)
+    if (!doc) return
     await Promise.all([
-      this.noteModel.deleteOne({
-        _id: id,
-      }),
-      this.commentService.model.deleteMany({
-        ref: id,
-        refType: CollectionRefTypes.Note,
-      }),
+      this.noteRepository.deleteById(id),
+      this.commentService.deleteForRef(CollectionRefTypes.Note, id),
+      this.draftService.deleteByRef(DraftRefType.Note, id),
+      this.fileReferenceService.removeReferencesForDocument(
+        id,
+        FileReferenceType.Note,
+      ),
+      this.slugTrackerService.deleteAllTracker(id),
     ])
     scheduleManager.schedule(async () => {
       await Promise.all([
         this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
           scope: EventScope.TO_SYSTEM,
         }),
-        this.eventManager.broadcast(BusinessEvents.NOTE_DELETE, id, {
-          scope: EventScope.TO_SYSTEM_VISITOR,
-        }),
+        this.eventManager.emit(
+          BusinessEvents.NOTE_DELETE,
+          { id },
+          { scope: EventScope.TO_SYSTEM_VISITOR },
+        ),
       ])
     })
   }
 
-  /**
-   * 查找 nid 时候正确，返回 _id
-   *
-   * @param {number} nid
-   * @returns {Types.ObjectId}
-   */
   async getIdByNid(nid: number) {
-    const document = await this.model
-      .findOne({
-        nid,
-      })
-      .lean()
-    if (!document) {
-      return null
-    }
-    return document._id
+    const document = await this.noteRepository.findByNid(nid)
+    return document?.id ?? null
   }
 
   async findOneByIdOrNid(unique: any) {
-    if (!isMongoId(unique)) {
-      const id = await this.getIdByNid(unique)
-      return this.model.findOne({ _id: id })
+    const stringified = String(unique)
+    // Snowflake IDs are 15+ digits; shorter numeric strings are interpreted as nid.
+    if (!/^\d{15,}$/.test(stringified)) {
+      const byNid = await this.noteRepository.findByNid(Number(unique))
+      if (byNid) return byNid
     }
-
-    return this.model.findById(unique)
+    return this.findById(stringified)
   }
 
   async getNotePaginationByTopicId(
     topicId: string,
-    pagination: PaginateOptions = {},
-    condition?: FilterQuery<NoteModel>,
+    pagination: { page?: number; limit?: number } & NoteSortOptions = {},
+    condition?: { isPublished?: boolean },
   ) {
-    const { page = 1, limit = 10, ...rest } = pagination
+    const { page = 1, limit = 10, sortBy, sortOrder } = pagination
+    return this.noteRepository.listByTopicId(topicId, page, limit, {
+      visibleOnly: condition?.isPublished === true,
+      sortBy,
+      sortOrder,
+    })
+  }
 
-    return await this.model.paginate(
-      {
-        topicId,
-        ...condition,
-      },
-      {
-        page,
-        limit,
-        ...rest,
-      },
-    )
+  async getTopicRecentUpdate(topicId: string, isAuthenticated: boolean) {
+    return this.noteRepository.getTopicRecentUpdate(topicId, {
+      visibleOnly: !isAuthenticated,
+    })
   }
 }

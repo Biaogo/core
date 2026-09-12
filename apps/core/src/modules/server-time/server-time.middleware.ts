@@ -3,15 +3,14 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 export async function trackResponseTimeMiddleware(
   req: IncomingMessage,
   res: ServerResponse,
-  next: Function,
+  next: () => Promise<void> | void,
 ) {
   const requestTimeFromHeader = Number(req.headers['x-request-time'])
-  const now = !Number.isNaN(requestTimeFromHeader)
-    ? requestTimeFromHeader
-    : Date.now()
+  const t2 = Number.isNaN(requestTimeFromHeader)
+    ? Date.now()
+    : requestTimeFromHeader
 
   res.setHeader('Content-Type', 'application/json')
-  // cors
   res.setHeader(
     'Access-Control-Allow-Origin',
     req.headers.origin || req.headers.referer || req.headers.host || '*',
@@ -22,12 +21,6 @@ export async function trackResponseTimeMiddleware(
   res.setHeader('Access-Control-Max-Age', '86400')
   await next()
 
-  res.write(
-    JSON.stringify({
-      t2: now,
-      t3: Date.now(),
-    }),
-  )
-
+  res.write(JSON.stringify({ t2, t3: Date.now() }))
   res.end()
 }

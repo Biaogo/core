@@ -1,11 +1,11 @@
 import type { IRequestAdapter } from '~/interfaces/adapter'
 import type { IController } from '~/interfaces/controller'
 import type { IRequestHandler } from '~/interfaces/request'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
 
-declare module '../core/client' {
+import type { HTTPClient } from '../core'
+
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -30,7 +30,7 @@ export class SnippetController<ResponseWrapper> implements IController {
   //   return this.proxy(id).get<Omit<SnippetModel, 'data'>>()
   // }
 
-  getByReferenceAndName<T = unknown>(reference: string, name: string) {
-    return this.proxy(reference)(name).get<T>()
+  getByPath<T = unknown>(path: string) {
+    return this.proxy('by-path').get<T>({ params: { path } })
   }
 }

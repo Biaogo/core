@@ -1,18 +1,14 @@
-import type { Document, PaginateModel } from 'mongoose'
-
-import '@mx-space/compiled/zx-global'
-
-import type { ModelType } from '@typegoose/typegoose/lib/types'
+/// <reference types="vite/client" />
 
 declare global {
   export type KV<T = any> = Record<string, T>
 
-  // @ts-ignore
-  export type MongooseModel<T> = ModelType<T> & PaginateModel<T & Document>
-
   export const isDev: boolean
 
   export const cwd: string
+
+  const __DEV__: boolean
+  const __TEST__: boolean
 }
 
 export {}

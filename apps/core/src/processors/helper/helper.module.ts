@@ -1,5 +1,4 @@
 import type { Provider } from '@nestjs/common'
-
 import { forwardRef, Global, Module } from '@nestjs/common'
 import { EventEmitterModule } from '@nestjs/event-emitter'
 import { ScheduleModule } from '@nestjs/schedule'
@@ -7,38 +6,40 @@ import { ThrottlerModule } from '@nestjs/throttler'
 
 import { THROTTLE_OPTIONS } from '~/app.config'
 import { AggregateModule } from '~/modules/aggregate/aggregate.module'
+import { AiModule } from '~/modules/ai/ai.module'
 import { NoteModule } from '~/modules/note/note.module'
 import { PageModule } from '~/modules/page/page.module'
 import { PostModule } from '~/modules/post/post.module'
+import { ReaderModule } from '~/modules/reader/reader.module'
 
 import { AssetService } from './helper.asset.service'
 import { BarkPushService } from './helper.bark.service'
 import { CountingService } from './helper.counting.service'
-import { CronService } from './helper.cron.service'
 import { EmailService } from './helper.email.service'
 import { EventManagerService } from './helper.event.service'
+import { EventPayloadEnricherService } from './helper.event-payload.service'
 import { HttpService } from './helper.http.service'
 import { ImageService } from './helper.image.service'
 import { JWTService } from './helper.jwt.service'
-import { TextMacroService } from './helper.macro.service'
-import { TaskQueueService } from './helper.tq.service'
+import { LexicalService } from './helper.lexical.service'
+import { TranslationService } from './helper.translation.service'
 import { UploadService } from './helper.upload.service'
 import { UrlBuilderService } from './helper.url-builder.service'
 
 const providers: Provider<any>[] = [
   AssetService,
   BarkPushService,
+  EventPayloadEnricherService,
+  LexicalService,
   CountingService,
-  CronService,
   EmailService,
   EventManagerService,
   HttpService,
-  JWTService,
   ImageService,
-  UrlBuilderService,
-  TaskQueueService,
-  TextMacroService,
+  JWTService,
+  TranslationService,
   UploadService,
+  UrlBuilderService,
 ]
 
 @Module({
@@ -62,9 +63,11 @@ const providers: Provider<any>[] = [
     }),
 
     forwardRef(() => AggregateModule),
+    forwardRef(() => AiModule),
     forwardRef(() => PostModule),
     forwardRef(() => NoteModule),
     forwardRef(() => PageModule),
+    forwardRef(() => ReaderModule),
   ],
   providers,
   exports: providers,

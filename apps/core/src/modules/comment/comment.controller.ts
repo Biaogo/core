@@ -1,12 +1,6 @@
-import { isUndefined, keyBy } from 'lodash'
-import type { DocumentType } from '@typegoose/typegoose'
-import type { Document, FilterQuery } from 'mongoose'
-import type { CommentModel } from './comment.model'
-
 import {
   Body,
   Delete,
-  ForbiddenException,
   forwardRef,
   Get,
   Inject,
@@ -14,121 +8,268 @@ import {
   Patch,
   Post,
   Query,
-  Req,
+  Res,
   UseInterceptors,
 } from '@nestjs/common'
+import { isUndefined, keyBy } from 'es-toolkit/compat'
+import type { FastifyReply } from 'fastify'
 
+import { RequestContext } from '~/common/contexts/request.context'
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
-import {
-  CurrentReaderId,
-  CurrentUser,
-} from '~/common/decorators/current-user.decorator'
+import { CurrentReaderId } from '~/common/decorators/current-user.decorator'
 import { HTTPDecorators } from '~/common/decorators/http.decorator'
-import { IpLocation, IpRecord } from '~/common/decorators/ip.decorator'
-import { IsAuthenticated } from '~/common/decorators/role.decorator'
-import { BizException } from '~/common/exceptions/biz.exception'
-import { CannotFindException } from '~/common/exceptions/cant-find.exception'
-import { NoContentCanBeModifiedException } from '~/common/exceptions/no-content-canbe-modified.exception'
+import { IpLocation, type IpRecord } from '~/common/decorators/ip.decorator'
+import { ReaderAuth } from '~/common/decorators/reader-auth.decorator'
+import { HasAdminAccess } from '~/common/decorators/role.decorator'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { withMeta } from '~/common/response/envelope.types'
+import { MetaObjectBuilder } from '~/common/response/meta-builder'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
-import { ErrorCodeEnum } from '~/constants/error-code.constant'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
-import { MongoIdDto } from '~/shared/dto/id.dto'
-import { PagerDto } from '~/shared/dto/pager.dto'
-import { transformDataToPaginate } from '~/transformers/paginate.transformer'
-import { scheduleManager } from '~/utils/schedule.util'
+import { type EntityIdDto, EntityIdSchema } from '~/shared/dto/id.dto'
+import { type BasicPagerDto, BasicPagerSchema } from '~/shared/dto/pager.dto'
 
 import { ConfigsService } from '../configs/configs.service'
-import { ReaderModel } from '../reader/reader.model'
+import { EntitlementService } from '../membership/entitlement.service'
 import { ReaderService } from '../reader/reader.service'
-import { UserModel } from '../user/user.model'
-import {
-  CommentDto,
-  CommentRefTypesDto,
-  CommentStatePatchDto,
-  EditCommentDto,
-  TextOnlyDto,
-} from './comment.dto'
-import { CommentReplyMailType } from './comment.enum'
 import { CommentFilterEmailInterceptor } from './comment.interceptor'
-import { CommentState } from './comment.model'
+import { CommentLifecycleService } from './comment.lifecycle.service'
+import {
+  AnonymousCommentSchema,
+  AnonymousReplyCommentSchema,
+  type BatchCommentDeleteDto,
+  BatchCommentDeleteSchema,
+  type BatchCommentStateDto,
+  BatchCommentStateSchema,
+  type CommentAdminPagerDto,
+  CommentAdminPagerSchema,
+  type CommentAuthorActivityQueryDto,
+  CommentAuthorActivityQuerySchema,
+  type CommentDto,
+  type CommentRefTypesDto,
+  CommentRefTypesSchema,
+  type CommentSourceCandidatesQueryDto,
+  CommentSourceCandidatesQuerySchema,
+  type CommentStatePatchDto,
+  CommentStatePatchSchema,
+  type CommentTabCountsQueryDto,
+  CommentTabCountsQuerySchema,
+  type EditCommentDto,
+  EditCommentSchema,
+  type ReaderCommentDto,
+  ReaderCommentSchema,
+  type ReaderReplyCommentDto,
+  ReaderReplyCommentSchema,
+  type ReplyCommentDto,
+} from './comment.schema'
 import { CommentService } from './comment.service'
+import type {
+  CommentFindFilter,
+  CommentModel,
+  CommentTab,
+} from './comment.types'
 
-const idempotenceMessage = '哦吼，这句话你已经说过啦'
-const NESTED_REPLY_MAX = 10
+const idempotenceMessage = 'Whoops, you already said this'
+
 @ApiController({ path: 'comments' })
 @UseInterceptors(CommentFilterEmailInterceptor)
 export class CommentController {
   constructor(
     private readonly commentService: CommentService,
+    private readonly lifecycleService: CommentLifecycleService,
     private readonly eventManager: EventManagerService,
     private readonly configsService: ConfigsService,
     @Inject(forwardRef(() => ReaderService))
     private readonly readerService: ReaderService,
+    private readonly entitlementService: EntitlementService,
   ) {}
+
+  private async withMembership<T extends { id: unknown }>(
+    readers: T[],
+  ): Promise<(T & { isMember: boolean })[]> {
+    const memberIds = await this.entitlementService.getActiveMemberIds(
+      readers.map((reader) => String(reader.id)),
+    )
+    return readers.map((reader) => ({
+      ...reader,
+      isMember: memberIds.has(String(reader.id)),
+    }))
+  }
+
+  private buildAdminCommentFilter(input: {
+    currentState?: number
+    refId?: string
+    refType?: string
+    search?: string
+    state?: number | 'all'
+    tab?: CommentTab
+    author?: string
+  }): CommentFindFilter {
+    const filter: CommentFindFilter = {}
+    if (input.tab) {
+      filter.tab = input.tab
+    } else {
+      const state = input.currentState ?? input.state
+      if (!isUndefined(state) && state !== 'all') filter.state = state
+    }
+    if (input.refType)
+      filter.refType = input.refType as CommentFindFilter['refType']
+    if (input.refId) filter.refId = input.refId
+    if (input.search) filter.search = input.search
+    if (input.author) filter.author = input.author
+    return filter
+  }
+
+  private async createCommentWithBody(
+    params: EntityIdDto,
+    body: Partial<CommentModel>,
+    ipLocation: IpRecord,
+    query: CommentRefTypesDto,
+  ) {
+    const hasAdminAccess = RequestContext.hasAdminAccess()
+    const { ref } = query
+    const id = params.id
+
+    if (!hasAdminAccess && !(await this.commentService.allowComment(id, ref))) {
+      throw createAppException(AppErrorCode.COMMENT_FORBIDDEN)
+    }
+
+    const model: Partial<CommentModel> = { ...body, ...ipLocation }
+    const comment = await this.commentService.createComment(id, model, ref)
+
+    this.lifecycleService.afterCreateComment(
+      String((comment as any).id),
+      ipLocation,
+    )
+
+    const [doc] = await this.commentService.fillAndReplaceAvatarUrl([comment])
+    return doc
+  }
+
+  private async replyCommentWithBody(
+    params: EntityIdDto,
+    body: Partial<CommentModel>,
+    ipLocation: IpRecord,
+  ) {
+    const hasAdminAccess = RequestContext.hasAdminAccess()
+    if (
+      !hasAdminAccess &&
+      !(await this.commentService.allowCommentByCommentId(params.id))
+    ) {
+      throw createAppException(AppErrorCode.COMMENT_FORBIDDEN)
+    }
+
+    const model: Partial<CommentModel> = {
+      ...body,
+      ...ipLocation,
+    }
+
+    const comment = await this.commentService.replyComment(params.id, model)
+    this.lifecycleService.afterReplyComment(comment, ipLocation)
+    const [doc] = await this.commentService.fillAndReplaceAvatarUrl([comment])
+    return doc
+  }
 
   @Get('/')
   @Auth()
-  async getRecentlyComments(@Query() query: PagerDto) {
-    const { size = 10, page = 1, state = 0 } = query
-
+  async getRecentlyComments(
+    @Query({ schema: CommentAdminPagerSchema }) query: CommentAdminPagerDto,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
+    const { size = 10, page = 1 } = query
+    // Spec §6.2: legacy `?state=` is honored for one release with a
+    // `Deprecation: true` response header so api-client can warn at the
+    // boundary. `?tab=` takes precedence when both are present.
+    if (!query.tab && query.state !== undefined) {
+      reply.header('Deprecation', 'true')
+    }
     const comments = await this.commentService.getComments({
       size,
       page,
-      state,
+      filter: this.buildAdminCommentFilter(query),
     })
     const readers = await this.readerService.findReaderInIds(
-      comments.docs.map((doc) => doc.readerId).filter(Boolean) as string[],
+      comments.data.map((doc) => doc.readerId).filter(Boolean) as string[],
     )
-    const readerMap = new Map<string, ReaderModel>()
-    for (const reader of readers) {
-      readerMap.set(reader._id.toHexString(), reader)
-    }
 
-    const res = transformDataToPaginate(comments)
-    Object.assign(res, {
-      readers: keyBy(readers, 'id'),
-    })
-    return res
+    const readerMap = keyBy(await this.withMembership(readers), 'id')
+    const data = comments.data.map((doc) => ({
+      ...doc,
+      reader: readerMap[(doc as any).readerId] ?? null,
+    }))
+    return withMeta(
+      data,
+      new MetaObjectBuilder().pagination(comments.pagination).build(),
+    )
   }
 
-  @Get('/:id')
-  async getComments(
-    @Param() params: MongoIdDto,
-    @IsAuthenticated() isAuthenticated: boolean,
+  @Get('/tab-counts')
+  @Auth()
+  async getTabCounts(
+    @Query({ schema: CommentTabCountsQuerySchema })
+    query: CommentTabCountsQueryDto,
   ) {
-    const { id } = params
-    const data: CommentModel | null = await this.commentService.model
-      .findOne({
-        _id: id,
-      })
-      .populate('parent')
-      .lean()
-
-    if (!data) {
-      throw new CannotFindException()
-    }
-    if (data.isWhispers && !isAuthenticated) {
-      throw new CannotFindException()
-    }
-
-    await this.commentService.fillAndReplaceAvatarUrl([data])
-    if (data.readerId) {
-      const reader = await this.readerService.findReaderInIds([data.readerId])
-      Object.assign(data, {
-        reader: reader[0],
-      })
-    }
-
-    return data
+    return this.commentService.getTabCounts({
+      refType: query.refType,
+      refId: query.refId,
+    })
   }
 
-  // 面向 C 端的评论查询接口
+  @Get('/author-activity')
+  @Auth()
+  async getAuthorActivity(
+    @Query({ schema: CommentAuthorActivityQuerySchema })
+    query: CommentAuthorActivityQueryDto,
+  ) {
+    return this.commentService.getAuthorActivity({
+      mail: query.mail,
+      ip: query.ip,
+      limit: query.limit,
+    })
+  }
+
+  @Get('/source-candidates')
+  @Auth()
+  async getSourceCandidates(
+    @Query({ schema: CommentSourceCandidatesQuerySchema })
+    query: CommentSourceCandidatesQueryDto,
+  ) {
+    const candidates = await this.commentService.getSourceCandidates({
+      refType: query.refType,
+      search: query.search,
+      size: query.size,
+    })
+    return withMeta(candidates, new MetaObjectBuilder().build())
+  }
+
+  @Get('/reader/me')
+  @ReaderAuth()
+  async getMyComments(
+    @Query({ schema: BasicPagerSchema }) query: BasicPagerDto,
+    @CurrentReaderId() readerId: string,
+  ) {
+    const { page = 1, size = 20 } = query
+    const comments = await this.commentService.getReaderComments(
+      readerId,
+      page,
+      size,
+    )
+    return withMeta(
+      comments.data.map((doc) => this.commentService.projectReaderComment(doc)),
+      new MetaObjectBuilder().pagination(comments.pagination).build(),
+    )
+  }
+
   @Get('/ref/:id')
   async getCommentsByRefId(
-    @Param() params: MongoIdDto,
-    @Query() query: PagerDto,
-    @IsAuthenticated() isAuthenticated: boolean,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Query({ schema: BasicPagerSchema }) query: BasicPagerDto,
+    @Query('hasAnchor') hasAnchor: string,
+    @Query('sort') sort: string | undefined,
+    @Query('around') around: string | undefined,
+    @HasAdminAccess() hasAdminAccess: boolean,
+    @CurrentReaderId() readerId: string | undefined,
   ) {
     const { id } = params
     const { page = 1, size = 10 } = query
@@ -136,341 +277,322 @@ export class CommentController {
     const configs = await this.configsService.get('commentOptions')
     const { commentShouldAudit } = configs
 
-    const $and: FilterQuery<CommentModel & Document<any, any, any>>[] = [
-      {
-        parent: undefined,
-        ref: id,
-      },
-      {
-        $or: commentShouldAudit
-          ? [
-              {
-                state: CommentState.Read,
-              },
-            ]
-          : [
-              {
-                state: CommentState.Read,
-              },
-              { state: CommentState.Unread },
-            ],
-      },
-    ]
+    const resolvedSort: 'pinned' | 'newest' | 'oldest' =
+      sort === 'newest' || sort === 'oldest' || sort === 'pinned'
+        ? sort
+        : 'pinned'
 
-    if (isAuthenticated) {
-      $and.push({
-        $or: [
-          { isWhispers: true },
-          { isWhispers: false },
-          {
-            isWhispers: { $exists: false },
-          },
-        ],
-      })
-    } else {
-      $and.push({
-        $or: [
-          { isWhispers: false },
-          {
-            isWhispers: { $exists: false },
-          },
-        ],
-      })
-    }
-    const comments = await this.commentService.model.paginate(
-      {
-        $and,
-      },
-      {
-        limit: size,
-        page,
-        sort: { pin: -1, created: -1 },
-        populate: {
-          path: 'children',
-          maxDepth: NESTED_REPLY_MAX,
-        },
-      },
-    )
+    const comments = await this.commentService.getCommentsByRefId(id, {
+      page,
+      size,
+      isAuthenticated: hasAdminAccess,
+      commentShouldAudit,
+      hasAnchor: hasAnchor === 'true',
+      sort: resolvedSort,
+      around,
+      readerId,
+    })
 
-    await this.commentService.fillAndReplaceAvatarUrl(comments.docs)
-    this.commentService.cleanDirtyData(comments.docs)
-    const result = transformDataToPaginate(comments)
-    const readerIds = comments.docs
-      .map((comment) => comment.readerId)
-      .filter((id) => !!id) as string[]
+    const readerIds = this.commentService.collectThreadReaderIds(comments.data)
     const readers = await this.readerService.findReaderInIds(readerIds)
 
-    Object.assign(result, {
-      readers: keyBy(readers, 'id'),
-    })
-
-    return result
-  }
-
-  @Post('/:id')
-  @HTTPDecorators.Idempotence({
-    expired: 20,
-    errorMessage: idempotenceMessage,
-  })
-  async comment(
-    @Param() params: MongoIdDto,
-    @Body() body: CommentDto,
-    @IsAuthenticated() isAuthenticated: boolean,
-    @IpLocation() ipLocation: IpRecord,
-    @Query() query: CommentRefTypesDto,
-  ) {
-    const { disableComment } = await this.configsService.get('commentOptions')
-    if (disableComment) {
-      throw new BizException(ErrorCodeEnum.CommentDisabled)
-    }
-    if (!isAuthenticated) {
-      await this.commentService.validAuthorName(body.author)
-    }
-
-    const { ref } = query
-
-    const id = params.id
-    if (
-      !(await this.commentService.allowComment(id, ref)) &&
-      !isAuthenticated
-    ) {
-      throw new ForbiddenException('主人禁止了评论')
-    }
-
-    const model: Partial<CommentModel> = { ...body, ...ipLocation }
-
-    const comment = await this.commentService.createComment(id, model, ref)
-
-    this.commentService.afterCreateComment(
-      comment.id,
-      ipLocation,
-      isAuthenticated,
+    const readerMap2 = keyBy(await this.withMembership(readers), 'id')
+    const refData = comments.data.map((doc) => ({
+      ...doc,
+      reader: readerMap2[(doc as any).readerId] ?? null,
+    }))
+    return withMeta(
+      refData,
+      new MetaObjectBuilder().pagination(comments.pagination).build(),
     )
-
-    return this.commentService
-      .fillAndReplaceAvatarUrl([comment])
-      .then((docs) => docs[0])
   }
 
-  @Post('/reply/:id')
-  @HTTPDecorators.Idempotence({
-    expired: 20,
-    errorMessage: idempotenceMessage,
-  })
+  @Get('/thread/:rootCommentId')
+  async getThreadReplies(
+    @Param('rootCommentId') rootCommentId: string,
+    @Query({ schema: BasicPagerSchema }) query: BasicPagerDto,
+    @Query('cursor') cursor: string,
+    @HasAdminAccess() hasAdminAccess: boolean,
+    @CurrentReaderId() readerId: string | undefined,
+  ) {
+    const { size = 10 } = query
+    const configs = await this.configsService.get('commentOptions')
+
+    const result = await this.commentService.getThreadReplies(rootCommentId, {
+      cursor,
+      size,
+      isAuthenticated: hasAdminAccess,
+      commentShouldAudit: configs.commentShouldAudit,
+      readerId,
+    })
+    return {
+      replies: result.replies,
+      remaining: result.remaining,
+      done: result.done,
+      nextCursor: result.nextCursor ?? null,
+    }
+  }
+
+  @Get('/:id/thread')
+  @Auth()
+  async getAdminThread(@Param({ schema: EntityIdSchema }) params: EntityIdDto) {
+    const thread = await this.commentService.getAdminThreadForComment(params.id)
+    if (!thread) {
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, {
+        id: params.id,
+      })
+    }
+    return thread
+  }
+
+  @Get('/:id')
+  async getComments(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @HasAdminAccess() hasAdminAccess: boolean,
+  ) {
+    const { id } = params
+    const data: CommentModel | null =
+      await this.commentService.findByIdWithRelations(id)
+
+    if (!data) {
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, { id })
+    }
+    if (data.isWhispers && !hasAdminAccess) {
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, { id })
+    }
+
+    await this.commentService.fillAndReplaceAvatarUrl([data])
+    if (data.readerId) {
+      const reader = await this.withMembership(
+        await this.readerService.findReaderInIds([data.readerId]),
+      )
+      Object.assign(data, { reader: reader[0] })
+    }
+
+    return data
+  }
+
+  @Post('/:id/report')
+  async reportComment(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @CurrentReaderId() readerId: string,
+    @IpLocation() ipLocation: IpRecord,
+  ) {
+    const result = await this.commentService.reportComment(params.id, {
+      ip: ipLocation.ip,
+      readerId: readerId || null,
+    })
+    if (result.notified) {
+      this.lifecycleService.afterReportComment(params.id)
+    }
+    return { ok: true }
+  }
+
+  @Post('/:id/report-and-block')
+  @ReaderAuth()
+  async reportAndBlockComment(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @CurrentReaderId() readerId: string,
+    @IpLocation() ipLocation: IpRecord,
+  ) {
+    const result = await this.commentService.reportAndBlockComment(params.id, {
+      ip: ipLocation.ip,
+      readerId,
+    })
+    if (result.notified) {
+      this.lifecycleService.afterReportComment(params.id)
+    }
+    return { blockedReaderId: result.blockedReaderId, ok: true }
+  }
+
+  @Post('/guest/:id')
+  @HTTPDecorators.Idempotence({ expired: 20, errorMessage: idempotenceMessage })
+  async guestComment(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: AnonymousCommentSchema }) body: CommentDto,
+    @IpLocation() ipLocation: IpRecord,
+    @Query({ schema: CommentRefTypesSchema }) query: CommentRefTypesDto,
+  ) {
+    const { allowGuestComment, disableComment } =
+      await this.configsService.get('commentOptions')
+    if (disableComment) {
+      throw createAppException(AppErrorCode.COMMENT_DISABLED)
+    }
+    if (!allowGuestComment) {
+      throw createAppException(AppErrorCode.COMMENT_FORBIDDEN)
+    }
+
+    await this.commentService.validAuthorName(body.author)
+    return this.createCommentWithBody(params, body, ipLocation, query)
+  }
+
+  @Post('/reader/:id')
+  @HTTPDecorators.Idempotence({ expired: 20, errorMessage: idempotenceMessage })
+  async readerComment(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: ReaderCommentSchema }) body: ReaderCommentDto,
+    @CurrentReaderId() readerId: string,
+    @IpLocation() ipLocation: IpRecord,
+    @Query({ schema: CommentRefTypesSchema }) query: CommentRefTypesDto,
+  ) {
+    const { disableComment } = await this.configsService.get('commentOptions')
+    if (disableComment && !RequestContext.hasAdminAccess()) {
+      throw createAppException(AppErrorCode.COMMENT_DISABLED)
+    }
+    if (!readerId) {
+      throw createAppException(AppErrorCode.AUTH_NOT_LOGGED_IN)
+    }
+    return this.createCommentWithBody(params, body, ipLocation, query)
+  }
+
+  @Post('/guest/reply/:id')
+  @HTTPDecorators.Idempotence({ expired: 20, errorMessage: idempotenceMessage })
+  async guestReplyByCid(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: AnonymousReplyCommentSchema }) body: ReplyCommentDto,
+    @IpLocation() ipLocation: IpRecord,
+  ) {
+    const { allowGuestComment, disableComment } =
+      await this.configsService.get('commentOptions')
+    if (disableComment) {
+      throw createAppException(AppErrorCode.COMMENT_DISABLED)
+    }
+    if (!allowGuestComment) {
+      throw createAppException(AppErrorCode.COMMENT_FORBIDDEN)
+    }
+    await this.commentService.validAuthorName(body.author)
+    return this.replyCommentWithBody(params, body, ipLocation)
+  }
+
+  @Post('/owner-reply/:id')
+  @Auth()
+  @HTTPDecorators.Idempotence({ expired: 20, errorMessage: idempotenceMessage })
   async replyByCid(
-    @Param() params: MongoIdDto,
-    @Body() body: CommentDto,
-    @Body('author') author: string,
-    @IsAuthenticated() isAuthenticated: boolean,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: ReaderReplyCommentSchema }) body: ReaderReplyCommentDto,
+    @IpLocation() ipLocation: IpRecord,
+  ) {
+    return this.replyCommentWithBody(params, body, ipLocation)
+  }
+
+  @Post('/reader/reply/:id')
+  @HTTPDecorators.Idempotence({ expired: 20, errorMessage: idempotenceMessage })
+  async readerReplyByCid(
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: ReaderReplyCommentSchema }) body: ReaderReplyCommentDto,
+    @CurrentReaderId() readerId: string,
     @IpLocation() ipLocation: IpRecord,
   ) {
     const { disableComment } = await this.configsService.get('commentOptions')
-    if (disableComment) {
-      throw new BizException(ErrorCodeEnum.CommentDisabled)
+    if (disableComment && !RequestContext.hasAdminAccess()) {
+      throw createAppException(AppErrorCode.COMMENT_DISABLED)
     }
-
-    if (!isAuthenticated) {
-      await this.commentService.validAuthorName(author)
+    if (!readerId) {
+      throw createAppException(AppErrorCode.AUTH_NOT_LOGGED_IN)
     }
-
-    const { id } = params
-
-    const parent = await this.commentService.model.findById(id).populate('ref')
-    if (!parent) {
-      throw new CannotFindException()
-    }
-    const commentIndex = parent.commentsIndex
-
-    if (parent.key && parent.key.split('#').length >= NESTED_REPLY_MAX) {
-      throw new BizException(ErrorCodeEnum.CommentTooDeep)
-    }
-
-    const key = `${parent.key}#${commentIndex}`
-
-    const model: Partial<CommentModel> = {
-      parent,
-      ref: (parent.ref as DocumentType<any>)._id,
-      refType: parent.refType,
-      ...body,
-      ...ipLocation,
-      key,
-      isWhispers: parent.isWhispers,
-    }
-
-    await this.commentService.assignReaderToComment(model)
-
-    const comment = await this.commentService.model.create(model)
-    const commentId = comment._id.toString()
-    scheduleManager.schedule(async () => {
-      if (isAuthenticated) {
-        return
-      }
-      await this.commentService.appendIpLocation(commentId, ipLocation.ip)
-    })
-
-    await parent.updateOne({
-      $push: {
-        children: comment._id,
-      },
-      $inc: {
-        commentsIndex: 1,
-      },
-      state:
-        comment.state === CommentState.Read &&
-        parent.state !== CommentState.Read
-          ? CommentState.Read
-          : parent.state,
-    })
-    if (isAuthenticated) {
-      this.commentService.sendEmail(comment, CommentReplyMailType.Guest)
-      this.eventManager.broadcast(BusinessEvents.COMMENT_CREATE, comment, {
-        scope: EventScope.TO_SYSTEM_VISITOR,
-      })
-    } else {
-      const configs = await this.configsService.get('commentOptions')
-      const { commentShouldAudit } = configs
-
-      if (commentShouldAudit) {
-        this.eventManager.broadcast(BusinessEvents.COMMENT_CREATE, comment, {
-          scope: EventScope.TO_SYSTEM_ADMIN,
-        })
-        return
-      }
-
-      this.commentService.sendEmail(comment, CommentReplyMailType.Owner)
-      this.eventManager.broadcast(BusinessEvents.COMMENT_CREATE, comment, {
-        scope: EventScope.ALL,
-      })
-    }
-    return this.commentService
-      .fillAndReplaceAvatarUrl([comment])
-      .then((docs) => docs[0])
-  }
-
-  @Post('/master/comment/:id')
-  @Auth()
-  @HTTPDecorators.Idempotence({
-    expired: 20,
-    errorMessage: idempotenceMessage,
-  })
-  async commentByMaster(
-    @CurrentUser() user: UserModel,
-    @Param() params: MongoIdDto,
-    @Body() body: TextOnlyDto,
-    @IpLocation() ipLocation: IpRecord,
-    @Query() query: CommentRefTypesDto,
-  ) {
-    const { name, mail, url } = user
-    const model: CommentDto = {
-      author: name,
-      ...body,
-      mail,
-      url,
-      state: CommentState.Read,
-    } as CommentDto
-    return await this.comment(params, model as any, true, ipLocation, query)
-  }
-
-  @Post('/master/reply/:id')
-  @Auth()
-  @HTTPDecorators.Idempotence({
-    expired: 20,
-    errorMessage: idempotenceMessage,
-  })
-  async replyByMaster(
-    @Req() req: any,
-    @Param() params: MongoIdDto,
-    @Body() body: TextOnlyDto,
-    @IpLocation() ipLocation: IpRecord,
-  ) {
-    const { name, mail, url } = req.user
-    const model: CommentDto = {
-      author: name,
-      ...body,
-      mail,
-      url,
-      state: CommentState.Read,
-    } as CommentDto
-    // @ts-ignore
-    return await this.replyByCid(params, model, undefined, true, ipLocation)
+    return this.replyCommentWithBody(params, body, ipLocation)
   }
 
   @Patch('/:id')
   @Auth()
   async modifyCommentState(
-    @Param() params: MongoIdDto,
-    @Body() body: CommentStatePatchDto,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: CommentStatePatchSchema }) body: CommentStatePatchDto,
   ) {
     const { id } = params
     const { state, pin } = body
 
-    const updateResult = {} as any
-
-    !isUndefined(state) && Reflect.set(updateResult, 'state', state)
-    !isUndefined(pin) && Reflect.set(updateResult, 'pin', pin)
+    const updateResult: Record<string, any> = {}
+    if (!isUndefined(state)) updateResult.state = state
+    if (!isUndefined(pin)) updateResult.pin = pin
 
     if (pin) {
-      const currentRefModel = await this.commentService.model
-        .findOne({
-          _id: id,
-        })
-        .lean()
-        .populate('ref')
-
-      const refId = (currentRefModel?.ref as any)?._id
-      if (refId) {
-        await this.commentService.model.updateMany(
-          {
-            ref: refId,
-          },
-          {
-            pin: false,
-          },
-        )
-      }
+      await this.commentService.clearPinForRefOfComment(id)
     }
 
     try {
-      await this.commentService.model.updateOne(
-        {
-          _id: id,
-        },
-        updateResult,
-      )
-
-      return
+      await this.commentService.updateComment(id, updateResult)
     } catch {
-      throw new NoContentCanBeModifiedException()
+      throw createAppException(AppErrorCode.NO_CONTENT_MODIFIABLE)
+    }
+
+    if (!isUndefined(state)) {
+      await this.commentService.cascadeFilesForCommentsIfSpam([id], state)
     }
   }
 
   @Delete('/:id')
   @Auth()
-  async deleteComment(@Param() params: MongoIdDto) {
+  async deleteComment(@Param({ schema: EntityIdSchema }) params: EntityIdDto) {
     const { id } = params
-    await this.commentService.deleteComments(id)
-    await this.eventManager.broadcast(BusinessEvents.COMMENT_DELETE, id, {
-      scope: EventScope.TO_SYSTEM_VISITOR,
-      nextTick: true,
-    })
-    return
+    await this.commentService.softDeleteComment(id)
+    await this.eventManager.emit(
+      BusinessEvents.COMMENT_DELETE,
+      { id },
+      { scope: EventScope.TO_SYSTEM_VISITOR, nextTick: true },
+    )
+  }
+
+  @Patch('/batch/state')
+  @Auth()
+  async batchUpdateState(
+    @Body({ schema: BatchCommentStateSchema }) body: BatchCommentStateDto,
+  ) {
+    const { ids, all, state } = body
+
+    let affected: string[] = []
+    if (all) {
+      const filter = this.buildAdminCommentFilter(body)
+      const matched = await this.commentService.findByFilter(filter)
+      affected = matched.map((c) => String(c.id))
+      await this.commentService.updateStateByFilter(filter, state)
+    } else if (ids?.length) {
+      affected = ids.map((id) => id.toString())
+      await this.commentService.updateStateBulk(ids, state)
+    }
+
+    if (affected.length) {
+      await this.commentService.cascadeFilesForCommentsIfSpam(affected, state)
+    }
+  }
+
+  @Delete('/batch')
+  @Auth()
+  async batchDelete(
+    @Body({ schema: BatchCommentDeleteSchema }) body: BatchCommentDeleteDto,
+  ) {
+    const { ids, all } = body
+
+    if (all) {
+      const filter = this.buildAdminCommentFilter(body)
+      const comments = await this.commentService.findByFilter(filter)
+      await Promise.all(
+        comments.map((comment) =>
+          this.commentService.softDeleteComment(String(comment.id)),
+        ),
+      )
+    } else if (ids?.length) {
+      await Promise.all(
+        ids.map((id) => this.commentService.softDeleteComment(id)),
+      )
+    }
   }
 
   @Patch('/edit/:id')
   async editComment(
-    @Param() params: MongoIdDto,
-    @Body() body: EditCommentDto,
-    @IsAuthenticated() isAuthenticated: boolean,
+    @Param({ schema: EntityIdSchema }) params: EntityIdDto,
+    @Body({ schema: EditCommentSchema }) body: EditCommentDto,
+    @HasAdminAccess() hasAdminAccess: boolean,
     @CurrentReaderId() readerId: string,
   ) {
     const { id } = params
     const { text } = body
-    const comment = await this.commentService.model.findById(id).lean()
+    const comment = await this.commentService.findById(id)
     if (!comment) {
-      throw new CannotFindException()
+      throw createAppException(AppErrorCode.COMMENT_NOT_FOUND, { id })
     }
-    if (comment.readerId !== readerId && !isAuthenticated) {
-      throw new ForbiddenException()
+    if (comment.readerId !== readerId && !hasAdminAccess) {
+      throw createAppException(AppErrorCode.COMMENT_FORBIDDEN)
     }
     await this.commentService.editComment(id, text)
   }

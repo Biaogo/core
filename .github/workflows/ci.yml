@@ -4,21 +4,47 @@ on:
       - 'v*'
     paths-ignore:
       - CHANGELOG.MD
-    branches: master
+      - 'apps/ios/**'
+    branches:
+      - master
   pull_request:
+    paths-ignore:
+      - CHANGELOG.MD
+      - 'apps/ios/**'
   workflow_dispatch:
 name: CI
 
+permissions:
+  contents: read
+
 jobs:
-  docker:
-    name: Docker build
+  quality:
+    name: Lint & Typecheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: '22.x'
+      - name: Run Lint
+        run: npm run lint
+      - name: Run Typecheck
+        run: npm run typecheck
+      - name: Lint migrations (expand-contract guard)
+        run: pnpm -C apps/core run lint:migrations
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             innei/mx-server
@@ -30,15 +56,15 @@ jobs:
             type=sha
             type=raw,value=latest
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Copy .env
         run: |
           cp .env.example .env
       - name: Build and export to Docker
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -54,83 +80,152 @@ jobs:
   core:
     name: Build (Core)
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [20.x]
-
-    steps:
-      - uses: actions/checkout@v4
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4.1.0
-        with:
-          version:
-          run_install: false
-
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Cache pnpm modules
-        uses: actions/cache@v4
+    needs: quality
+    env:
+      REDISMS_DISABLE_POSTINSTALL: 1
+    services:
+      postgres:
+        image: postgres:16-alpine
         env:
-          cache-name: cache-pnpm-modules
+          POSTGRES_USER: mx
+          POSTGRES_PASSWORD: mx
+          POSTGRES_DB: mx_core
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mx -d mx_core"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node
         with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ matrix.node-version }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-build-${{ env.cache-name }}-${{ matrix.node-version }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-      - name: Install Dependencies
-        run: |
-          pnpm i
+          node-version: '22.x'
       - name: Build project
-        run: |
-          npm run bundle
-      - name: Start MongoDB
-        uses: supercharge/mongodb-github-action@1.12.0
-        with:
-          mongodb-version: 4.4
-      - name: Start Redis
-        uses: supercharge/redis-github-action@1.8.0
-        with:
-          redis-version: 6
+        run: npm run bundle
       - name: Test Bundle Server
-        run: |
-          bash scripts/workflow/test-server.sh
-  test:
-    name: Test
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [20.x]
-
-    steps:
-      - uses: actions/checkout@v4
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          run_install: |
-            - recursive: false
-      - name: Run Lint
-        run: |
-          npm run lint
-
-      - name: Run Tests
-        run: |
-          npm run test
-
+        run: bash scripts/workflow/test-server.sh
         env:
+          SNOWFLAKE_WORKER_ID: 1
+          PG_HOST: 127.0.0.1
+          PG_PORT: 5432
+          PG_USER: mx
+          PG_PASSWORD: mx
+          PG_DATABASE: mx_core
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          JWT_SECRET: test-bundle-server-jwt-secret
+          MIGRATIONS_DIR: ${{ github.workspace }}/apps/core/src/database/migrations
+
+  e2e:
+    name: CLI ↔ Core E2E
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    needs: quality
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: mx
+          POSTGRES_PASSWORD: mx
+          POSTGRES_DB: mx_core_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mx -d mx_core_e2e"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: '22.x'
+      - name: Run E2E
+        run: pnpm e2e
+        env:
+          NODE_ENV: development
           CI: true
+          SNOWFLAKE_WORKER_ID: 1
+          PG_VERIFY_URL: postgres://mx:mx@127.0.0.1:5432/mx_core_e2e
+          PG_URL: postgres://mx:mx@127.0.0.1:5432/mx_core_e2e
+          PG_CONNECTION_STRING: postgres://mx:mx@127.0.0.1:5432/mx_core_e2e
+          PG_HOST: 127.0.0.1
+          PG_PORT: 5432
+          PG_USER: mx
+          PG_PASSWORD: mx
+          PG_DATABASE: mx_core_e2e
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_CONNECTION_STRING: redis://127.0.0.1:6379
+          REDIS_VERIFY_URL: redis://127.0.0.1:6379
+          JWT_SECRET: e2e-jwt-secret-e2e-jwt-secret-123456
+          MIGRATIONS_DIR: ${{ github.workspace }}/apps/core/src/database/migrations
+
+  test:
+    name: Test (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mx
+          POSTGRES_PASSWORD: mx
+          POSTGRES_DB: mx_core_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mx -d mx_core_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: '22.x'
+      - name: Install Redis Server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+      - name: Run Tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+        run: pnpm -C apps/core exec vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        env:
+          NODE_ENV: development
+          CI: true
+          REDIS_BINARY_PATH: /usr/bin/redis-server
+          REDISMS_SYSTEM_BINARY: /usr/bin/redis-server
+          SNOWFLAKE_WORKER_ID: 1
+          PG_VERIFY_URL: postgres://mx:mx@127.0.0.1:5432/mx_core_test
+          PG_URL: postgres://mx:mx@127.0.0.1:5432/mx_core_test
+          PG_CONNECTION_STRING: postgres://mx:mx@127.0.0.1:5432/mx_core_test
+          PG_HOST: 127.0.0.1
+          PG_PORT: 5432
+          PG_USER: mx
+          PG_PASSWORD: mx
+          PG_DATABASE: mx_core_test

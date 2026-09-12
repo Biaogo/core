@@ -1,19 +1,14 @@
 import type { IRequestAdapter } from '~/interfaces/adapter'
 import type { IController } from '~/interfaces/controller'
 import type { IRequestHandler, RequestProxyResult } from '~/interfaces/request'
-import type { SelectFields } from '~/interfaces/types'
 import type { PaginateResult } from '~/models/base'
-import type {
-  NoteModel,
-  NoteWrappedPayload,
-  NoteWrappedWithLikedPayload,
-} from '~/models/note'
+import type { NoteModel, NoteWrappedPayload } from '~/models/note'
+import { autoBind } from '~/utils/auto-bind'
+
 import type { HTTPClient } from '../core/client'
 import type { SortOptions } from './base'
 
-import { autoBind } from '~/utils/auto-bind'
-
-declare module '../core/client' {
+declare module '@mx-space/api-client' {
   interface HTTPClient<
     T extends IRequestAdapter = IRequestAdapter,
     ResponseWrapper = unknown,
@@ -23,11 +18,34 @@ declare module '../core/client' {
 }
 
 export type NoteListOptions = {
-  select?: SelectFields<keyof NoteModel>
   year?: number
-  sortBy?: 'weather' | 'mood' | 'title' | 'created' | 'modified'
+  sortBy?: 'weather' | 'mood' | 'title' | 'createdAt' | 'modifiedAt'
   sortOrder?: 1 | -1
+  lang?: string
+  withSummary?: boolean
 }
+
+export type NoteByNidOptions = {
+  password?: string
+  single?: boolean
+  lang?: string
+  prefer?: 'lexical'
+}
+
+export type NoteBySlugDateOptions = NoteByNidOptions
+
+export type NoteMiddleListOptions = {
+  lang?: string
+}
+
+export type NoteTopicListOptions = SortOptions & {
+  lang?: string
+}
+
+export type NoteTimelineItem = Pick<
+  NoteModel,
+  'id' | 'title' | 'nid' | 'slug' | 'createdAt' | 'isPublished'
+>
 
 export class NoteController<ResponseWrapper> implements IController {
   base = 'notes'
@@ -44,7 +62,7 @@ export class NoteController<ResponseWrapper> implements IController {
    * 最新日记
    */
   getLatest() {
-    return this.proxy.latest.get<NoteWrappedWithLikedPayload>()
+    return this.proxy.latest.get<NoteWrappedPayload>()
   }
 
   /**
@@ -72,7 +90,7 @@ export class NoteController<ResponseWrapper> implements IController {
     const [id, password = undefined, singleResult = false] = rest
 
     if (typeof id === 'number') {
-      return this.proxy.nid(id.toString()).get<NoteWrappedWithLikedPayload>({
+      return this.proxy.nid(id.toString()).get<NoteWrappedPayload>({
         params: { password, single: singleResult ? '1' : undefined },
       })
     } else {
@@ -81,46 +99,106 @@ export class NoteController<ResponseWrapper> implements IController {
   }
 
   /**
+   * 根据 nid 获取日记，支持翻译参数
+   * @param nid 日记编号
+   * @param options 可选参数：password, single, lang
+   */
+  getNoteByNid(
+    nid: number,
+    options?: NoteByNidOptions,
+  ): RequestProxyResult<NoteWrappedPayload, ResponseWrapper> {
+    const { password, single, lang, prefer } = options || {}
+    return this.proxy.nid(nid.toString()).get({
+      params: {
+        password,
+        single: single ? '1' : undefined,
+        lang,
+        prefer,
+      },
+    })
+  }
+
+  getNoteBySlugDate(
+    year: number,
+    month: number,
+    day: number,
+    slug: string,
+    options?: NoteBySlugDateOptions,
+  ): RequestProxyResult<NoteWrappedPayload, ResponseWrapper> {
+    const { password, single, lang, prefer } = options || {}
+    return this.proxy(year.toString())(month.toString())(day.toString())(
+      slug,
+    ).get({
+      params: {
+        password,
+        single: single ? '1' : undefined,
+        lang,
+        prefer,
+      },
+    })
+  }
+
+  /**
    * 日记列表分页
    */
 
   getList(page = 1, perPage = 10, options: NoteListOptions = {}) {
-    const { select, sortBy, sortOrder, year } = options
+    const { sortBy, sortOrder, year, lang, withSummary } = options
     return this.proxy.get<PaginateResult<NoteModel>>({
       params: {
         page,
         size: perPage,
-        select: select?.join(' '),
         sortBy,
         sortOrder,
         year,
+        lang,
+        withSummary: withSummary ? '1' : undefined,
       },
     })
   }
 
   /**
    * 获取当前日记的上下各 n / 2 篇日记
+   * @param id 当前日记 ID
+   * @param size 返回数量，默认 5
+   * @param options 可选参数，包含 lang 用于获取翻译版本
    */
-  getMiddleList(id: string, size = 5) {
+  getMiddleList(id: string, size = 5, options?: NoteMiddleListOptions) {
+    const { lang } = options || {}
     return this.proxy.list(id).get<{
-      data: Pick<NoteModel, 'id' | 'title' | 'nid' | 'created' | 'hide'>[]
+      data: NoteTimelineItem[]
       size: number
     }>({
-      params: { size },
+      params: { size, lang },
     })
   }
 
   /**
    * 获取专栏内的所有日记
+   * @param topicId 专栏 ID
+   * @param page 页码，默认 1
+   * @param size 每页数量，默认 10
+   * @param options 可选参数，包含排序选项和 lang 用于获取翻译版本
    */
   getNoteByTopicId(
     topicId: string,
     page = 1,
     size = 10,
-    sortOptions: SortOptions = {},
+    options: NoteTopicListOptions = {},
   ) {
+    const { lang, ...sortOptions } = options
     return this.proxy.topics(topicId).get<PaginateResult<NoteModel>>({
-      params: { page, size, ...sortOptions },
+      params: { page, size, lang, ...sortOptions },
     })
+  }
+
+  /**
+   * 获取专栏的最近更新时间（取该专栏下所有可见日记 max(modified, created)）
+   * @param topicId 专栏 ID
+   */
+  getTopicRecentUpdate(topicId: string) {
+    return this.proxy.topics(topicId)['recent-update'].get<{
+      ts: string | null
+    }>()
   }
 }

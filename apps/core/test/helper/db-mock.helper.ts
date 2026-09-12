@@ -1,64 +1,42 @@
-import { MongoMemoryServer } from 'mongodb-memory-server'
-import mongoose from 'mongoose'
-import type {
-  AnyParamConstructor,
-  BeAnObject,
-  IModelOptions,
-  ReturnModelType,
-} from '@typegoose/typegoose/lib/types'
+import { Pool } from 'pg'
 
-import { getModelForClass } from '@typegoose/typegoose'
+import { assertSafeTestDatabaseName } from './pg-test-database-safety'
+import { startPgTestContainer, stopPgTestContainer } from './pg-testcontainer'
 
-let mongod: MongoMemoryServer
+let pool: Pool | undefined
 
-/**
- 
- * Connect to mock memory db.
- */
 const connect = async () => {
-  mongod = await MongoMemoryServer.create()
-  const uri = mongod.getUri()
-
-  return await mongoose.connect(uri, {
-    autoIndex: true,
-    maxPoolSize: 10,
-  })
+  const container = await startPgTestContainer()
+  pool = new Pool({ connectionString: container.getConnectionUri() })
+  return pool
 }
 
-/**
- * Close db connection
- */
 const closeDatabase = async () => {
-  await mongoose.connection.dropDatabase()
-  await mongoose.connection.close()
-  await mongod.stop()
+  await pool?.end()
+  pool = undefined
+  await stopPgTestContainer()
 }
 
-/**
- * Delete db collections
- */
 const clearDatabase = async () => {
-  const collections = mongoose.connection.collections
-
-  for (const key in collections) {
-    const collection = collections[key]
-    await collection.deleteMany({})
-  }
+  if (!pool) return
+  const databaseResult = await pool.query<{ databaseName: string }>(
+    'select current_database() as "databaseName"',
+  )
+  assertSafeTestDatabaseName(databaseResult.rows[0].databaseName)
+  // Every vitest worker truncates the same shared PG. TRUNCATE takes its
+  // AccessExclusiveLocks in the order the tables are listed, so an unordered
+  // pg_tables scan lets two workers lock the same tables in opposite orders
+  // and deadlock (40P01). Sorting gives all workers one global lock order.
+  const { rows } = await pool.query(
+    `select tablename from pg_tables where schemaname = 'public' order by tablename`,
+  )
+  if (rows.length === 0) return
+  const tables = rows.map((r: any) => `"${r.tablename}"`).join(', ')
+  await pool.query(`truncate table ${tables} restart identity cascade`)
 }
 
 export const dbHelper = {
   connect,
   close: closeDatabase,
   clear: clearDatabase,
-
-  getModel<U extends AnyParamConstructor<any>, QueryHelpers = BeAnObject>(
-    cl: U,
-    options?: IModelOptions,
-  ): ReturnModelType<U, QueryHelpers> {
-    return getModelForClass(cl, {
-      existingMongoose: mongoose,
-      existingConnection: mongoose.connection,
-      ...options,
-    })
-  },
 }

@@ -1,142 +1,142 @@
-import { Namespace, Socket } from 'socket.io'
+import type { IncomingMessage } from 'node:http'
 
 import { OnEvent } from '@nestjs/event-emitter'
-import {
-  OnGatewayConnection,
-  OnGatewayDisconnect,
-  WebSocketServer,
-} from '@nestjs/websockets'
+import type { WebSocket } from 'ws'
 
 import { EventBusEvents } from '~/constants/event-bus.constant'
 import { AuthService } from '~/modules/auth/auth.service'
-import { JWTService } from '~/processors/helper/helper.jwt.service'
-import { RedisService } from '~/processors/redis/redis.service'
 
 import { BusinessEvents } from '../../../constants/business-event.constant'
-import { BroadcastBaseGateway } from '../base.gateway'
+import type { WsConnection, WsNamespace } from '../ws/ws.types'
+import { WsBusService } from '../ws/ws-bus.service'
+import { WsGatewayBase } from '../ws/ws-gateway.base'
+import { WsPresenceService } from '../ws/ws-presence.service'
 
 export type AuthGatewayOptions = {
-  namespace: string
-  authway?: 'jwt' | 'custom-token' | 'all'
+  namespace: WsNamespace
 }
 
-// @ts-ignore
-export interface IAuthGateway
-  extends OnGatewayConnection,
-    OnGatewayDisconnect,
-    BroadcastBaseGateway {}
+const AUTH_FAILED_CLOSE_CODE = 4401
 
-export const createAuthGateway = (
-  options: AuthGatewayOptions,
-): new (...args: any[]) => IAuthGateway => {
-  const { namespace, authway = 'all' } = options
-  class AuthGateway extends BroadcastBaseGateway implements IAuthGateway {
+export const createAuthGateway = (options: AuthGatewayOptions) => {
+  const { namespace } = options
+
+  class AuthGateway extends WsGatewayBase {
     constructor(
-      protected readonly jwtService: JWTService,
       protected readonly authService: AuthService,
-      private readonly redisService: RedisService,
+      bus: WsBusService,
+      presence: WsPresenceService,
     ) {
-      super()
+      super(namespace, bus, presence)
     }
 
-    @WebSocketServer()
-    protected namespace: Namespace
-
-    authFailed(client: Socket) {
-      client.send(
-        this.gatewayMessageFormat(BusinessEvents.AUTH_FAILED, '认证失败'),
-      )
-      client.disconnect()
-    }
-
-    async authToken(token: string): Promise<boolean> {
-      if (typeof token !== 'string') {
-        return false
-      }
-      const validCustomToken = async () => {
-        const [verifyCustomToken] =
-          await this.authService.verifyCustomToken(token)
-        if (verifyCustomToken) {
-          return true
-        }
-        return false
-      }
-
-      const validJwt = async () => {
-        try {
-          const ok = await this.jwtService.verify(token)
-
-          if (!ok) {
-            return false
-          }
-        } catch {
-          return false
-        }
-        // is not crash, is verify
-        return true
-      }
-
-      switch (authway) {
-        case 'custom-token': {
-          return await validCustomToken()
-        }
-        case 'jwt': {
-          return await validJwt()
-        }
-        case 'all': {
-          const validCustomTokenResult = await validCustomToken()
-          return validCustomTokenResult || (await validJwt())
-        }
-      }
-    }
-
-    async handleConnection(client: Socket) {
-      const token =
-        client.handshake.query.token ||
-        client.handshake.headers.authorization ||
-        client.handshake.headers.Authorization
-      if (!token) {
-        return this.authFailed(client)
-      }
-      if (!(await this.authToken(token as string))) {
-        return this.authFailed(client)
-      }
-
-      super.handleConnect(client)
-
-      const sid = client.id
-      this.tokenSocketIdMap.set(token.toString(), sid)
-    }
-
-    handleDisconnect(client: Socket) {
-      super.handleDisconnect(client)
-    }
     tokenSocketIdMap = new Map<string, string>()
+    private readonly socketIdTokenMap = new Map<string, string>()
+
+    protected bindToken(token: string, conn: WsConnection) {
+      this.tokenSocketIdMap.set(token, conn.id)
+      this.socketIdTokenMap.set(conn.id, token)
+    }
+
+    protected unbindToken(conn: WsConnection) {
+      const token = this.socketIdTokenMap.get(conn.id)
+      if (!token) return
+      this.socketIdTokenMap.delete(conn.id)
+      if (this.tokenSocketIdMap.get(token) === conn.id) {
+        this.tokenSocketIdMap.delete(token)
+      }
+    }
+
+    authFailed(conn: WsConnection) {
+      this.sendTo(conn, BusinessEvents.AUTH_FAILED, 'Authentication failed')
+      conn.ws.close(AUTH_FAILED_CLOSE_CODE, 'auth failed')
+    }
+
+    async handleConnection(ws: WebSocket, request: IncomingMessage) {
+      const conn = this.trackConnection(ws)
+      await this.presence.addConnection(namespace, conn.id)
+
+      const { cookie, origin } = request.headers
+      if (cookie) {
+        const headers = new Headers()
+        headers.set('cookie', cookie)
+        if (origin) {
+          headers.set('origin', origin)
+        }
+        const session =
+          await this.authService.getSessionUserFromHeaders(headers)
+        if (session?.user?.role === 'owner') {
+          return this.completeConnection(conn, session.session?.token)
+        }
+      }
+
+      const headerApiKey = request.headers['x-api-key']
+      const headerAuthorization = request.headers.authorization
+      const apiKey =
+        (Array.isArray(headerApiKey) ? headerApiKey[0] : headerApiKey) ||
+        headerAuthorization ||
+        queryToken(request)
+      if (!apiKey) {
+        return this.authFailed(conn)
+      }
+
+      const token = apiKey.replace(/^bearer\s+/i, '')
+      const result = await this.authService.verifyApiKey(token)
+      if (
+        !result ||
+        !(await this.authService.isOwnerReaderId(result.referenceId))
+      ) {
+        return this.authFailed(conn)
+      }
+
+      this.completeConnection(conn, token)
+    }
+
+    // A close during the auth lookups already unbound this connection; binding
+    // now would strand the token entry, since nothing unbinds it again.
+    private completeConnection(conn: WsConnection, token?: string) {
+      if (!this.resolveConnection(conn.ws)) return
+      this.sendConnectGreeting(conn)
+      if (token) this.bindToken(token, conn)
+    }
+
+    async handleDisconnect(ws: WebSocket) {
+      const conn = this.resolveConnection(ws)
+      if (!conn) return
+
+      await this.releaseConnection(conn)
+      this.unbindToken(conn)
+      this.sendDisconnectGreeting(conn)
+    }
 
     @OnEvent(EventBusEvents.TokenExpired)
     handleTokenExpired(token: string) {
-      // consola.debug(`token expired: ${token}`)
-
-      const server = this.namespace.server
-      const sid = this.tokenSocketIdMap.get(token)
-      if (!sid) {
+      const id = this.tokenSocketIdMap.get(token)
+      if (!id) {
         return false
       }
-      const socket = server.of(`/${namespace}`).sockets.get(sid)
-      if (socket) {
-        socket.disconnect()
-        super.handleDisconnect(socket)
-        return true
+      const conn = this.registry.get(id)
+      if (!conn) {
+        this.tokenSocketIdMap.delete(token)
+        return false
       }
-      return false
-    }
 
-    override broadcast(event: BusinessEvents, data: any) {
-      this.redisService.emitter
-        .of(`/${namespace}`)
-        .emit('message', this.gatewayMessageFormat(event, data))
+      conn.ws.close(AUTH_FAILED_CLOSE_CODE, 'token expired')
+      void this.handleDisconnect(conn.ws)
+      return true
     }
   }
 
   return AuthGateway
+}
+
+function queryToken(request: IncomingMessage): string | undefined {
+  try {
+    return (
+      new URL(request.url ?? '', 'ws://localhost').searchParams.get('token') ??
+      undefined
+    )
+  } catch {
+    return undefined
+  }
 }

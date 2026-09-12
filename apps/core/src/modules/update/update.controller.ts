@@ -1,16 +1,20 @@
-import { isSemVer } from 'class-validator'
-import { catchError, lastValueFrom, Observable } from 'rxjs'
-import { lt, major, minor } from 'semver'
+import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 
 import { Query, Sse } from '@nestjs/common'
+import pc from 'picocolors'
+import { catchError, Observable } from 'rxjs'
+import { lt, major } from 'semver'
 
-import { dashboard } from '~/../package.json'
 import { ApiController } from '~/common/decorators/api-controller.decorator'
 import { Auth } from '~/common/decorators/auth.decorator'
 import { HTTPDecorators } from '~/common/decorators/http.decorator'
-import { LOCAL_ADMIN_ASSET_PATH } from '~/constants/path.constant'
+import { resolveAdminAssetRoot } from '~/constants/path.constant'
+import { isDev } from '~/global/env.global'
+import { isSemVer } from '~/utils/validator.util'
 
-import { UpdateAdminDto } from './update.dto'
+import { type UpdateAdminDto, UpdateAdminSchema } from './update.schema'
 import { UpdateService } from './update.service'
 
 @ApiController('update')
@@ -20,90 +24,86 @@ export class UpdateController {
 
   @Sse('/upgrade/dashboard')
   @HTTPDecorators.Idempotence()
-  @HTTPDecorators.Bypass
+  @HTTPDecorators.RawResponse
   async updateDashboard(
-    @Query() query: UpdateAdminDto,
+    @Query({ schema: UpdateAdminSchema }) query: UpdateAdminDto,
   ): Promise<Observable<string>> {
     const { force = false } = query
 
     const sseOutput$ = new Observable<string>((observer) => {
-      ;(async () => {
-        // 1. check current local admin version if exist.
-        let { version: currentVersion } = dashboard
-
-        const isExistLocalAdmin = fs.pathExistsSync(LOCAL_ADMIN_ASSET_PATH)
-
-        if (!isExistLocalAdmin) {
-          // 2. if not has local admin, then pull remote admin version.
-          const stream$ = this.service.downloadAdminAsset(currentVersion)
-          stream$.subscribe((data) => {
-            observer.next(data)
+      const pipeStream = (stream$: Observable<string>) =>
+        new Promise<void>((resolve) => {
+          stream$.subscribe({
+            next: (data) => observer.next(data),
+            complete: () => resolve(),
+            error: () => resolve(),
           })
-          await lastValueFrom(stream$)
+        })
+
+      const run = async () => {
+        let currentVersion = '0.0.0'
+
+        const adminAssetRoot = resolveAdminAssetRoot('index.html')
+        const isExistLocalAdmin = existsSync(
+          path.join(adminAssetRoot, 'index.html'),
+        )
+
+        let latestVersion: string
+        try {
+          latestVersion = await this.service.getLatestAdminVersion()
+        } catch (error: any) {
+          observer.next(
+            pc.red(`Fetching latest admin version error: ${error.message}\n`),
+          )
           observer.complete()
           return
         }
 
-        const versionPath = path.resolve(LOCAL_ADMIN_ASSET_PATH, 'version')
-        const isHasVersion = fs.existsSync(versionPath)
-        if (isHasVersion) {
-          const versionInfo = await fs.promises
-            .readFile(versionPath, {
-              encoding: 'utf8',
-            })
-            .then((data) => data.split('\n')[0])
-            .catch(() => '')
+        if (!isExistLocalAdmin) {
+          await pipeStream(
+            this.service.startClusterAdminAssetUpdate(latestVersion),
+          )
+          observer.complete()
+          return
+        }
+
+        const versionPath = path.resolve(adminAssetRoot, 'version')
+        if (existsSync(versionPath)) {
+          let versionInfo: string
+          try {
+            const data = await readFile(versionPath, { encoding: 'utf8' })
+            versionInfo = data.split('\n')[0]
+          } catch {
+            versionInfo = ''
+          }
           if (isSemVer(versionInfo)) {
             currentVersion = versionInfo
           }
         }
 
-        // 3. fetch latest admin version
-        const latestVersion = await this.service
-          .getLatestAdminVersion()
-          .catch((error) => {
-            observer.next(
-              chalk.red(
-                `Fetching latest admin version error: ${error.message}\n`,
-              ),
-            )
-            observer.complete()
-            return ''
-          })
-
-        if (!latestVersion) {
-          return
-        }
-
         if (!lt(currentVersion, latestVersion)) {
-          observer.next(chalk.green(`Admin dashboard is up to date.\n`))
+          observer.next(pc.green(`Admin dashboard is up to date.\n`))
           observer.complete()
           return
         }
-        if (
-          !force &&
-          !isDev &&
-          (minor(currentVersion) !== minor(latestVersion) ||
-            major(currentVersion) !== major(latestVersion))
-        ) {
+        const isMajorJump = major(currentVersion) !== major(latestVersion)
+        if (!force && !isDev && isMajorJump) {
           observer.next(
-            chalk.red(
-              `The latest version is ${latestVersion}, current version is ${currentVersion}, can not cross-version upgrade.\n`,
+            pc.red(
+              `Major version jump ${currentVersion} -> ${latestVersion} requires force=true.\n`,
             ),
           )
           observer.complete()
           return
         }
 
-        // 4. download latest admin version
-        const stream$ = this.service.downloadAdminAsset(latestVersion)
-
-        stream$.subscribe((data) => {
-          observer.next(data)
-        })
-        await lastValueFrom(stream$)
+        await pipeStream(
+          this.service.startClusterAdminAssetUpdate(latestVersion),
+        )
         observer.complete()
-      })()
+      }
+
+      void run()
     })
 
     return sseOutput$.pipe(

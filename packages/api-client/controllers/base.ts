@@ -1,8 +1,8 @@
 import type { IRequestHandler, RequestProxyResult } from '~/interfaces/request'
 import type { PaginateResult } from '~/models/base'
-import type { HTTPClient } from '../core'
-
 import { autoBind } from '~/utils/auto-bind'
+
+import type { HTTPClient } from '../core'
 
 export type SortOptions = {
   sortBy?: string
@@ -22,7 +22,7 @@ export abstract class BaseCrudController<T, ResponseWrapper> {
   }
 
   getAll() {
-    return this.proxy.all.get<{ data: T[] }>()
+    return this.proxy.all.get<T[]>()
   }
   /**
    * 带分页的查询

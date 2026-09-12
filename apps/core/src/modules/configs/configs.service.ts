@@ -1,91 +1,188 @@
-import cluster from 'node:cluster'
-import { plainToInstance } from 'class-transformer'
-import { validateSync } from 'class-validator'
-import { cloneDeep, merge, mergeWith } from 'lodash'
-import type { ClassConstructor } from 'class-transformer'
+import type { OnModuleInit } from '@nestjs/common'
+import { Injectable, Logger } from '@nestjs/common'
+import { cloneDeep, merge, mergeWith } from 'es-toolkit/compat'
+import type { z, ZodError } from 'zod'
 
-import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common'
-import { ReturnModelType } from '@typegoose/typegoose'
-
-import { ExtendedValidationPipe } from '~/common/pipes/validation.pipe'
-import { EventScope } from '~/constants/business-event.constant'
+import { AppErrorCode, createAppException } from '~/common/errors'
+import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { RedisKeys } from '~/constants/cache.constant'
 import { EventBusEvents } from '~/constants/event-bus.constant'
-import { VALIDATION_PIPE_INJECTION } from '~/constants/system.constant'
+import {
+  type AIModelAssignment,
+  type AIProviderCapability,
+  type AIProviderConfig,
+  AIProviderType,
+} from '~/modules/ai/ai.types'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
+import {
+  ConfigVersionScopes,
+  ConfigVersionService,
+} from '~/processors/redis/config-version.service'
 import { RedisService } from '~/processors/redis/redis.service'
-import { SubPubBridgeService } from '~/processors/redis/subpub.service'
-import { InjectModel } from '~/transformers/model.transformer'
 import { getRedisKey } from '~/utils/redis.util'
 import { camelcaseKeys } from '~/utils/tool.util'
 
 import { generateDefaultConfig } from './configs.default'
-import { OAuthDto } from './configs.dto'
-import { decryptObject, encryptObject } from './configs.encrypt.util'
+import {
+  decryptObject,
+  encryptObject,
+  removeEmptyEncryptedFields,
+  sanitizeConfigForResponse,
+} from './configs.encrypt.util'
 import { configDtoMapping, IConfig } from './configs.interface'
-import { OptionModel } from './configs.model'
+import type { OAuthConfig } from './configs.schema'
+import { OptionsRepository } from './options.repository'
 
 const configsKeySet = new Set(Object.keys(configDtoMapping))
+const aggregateConfigKeys = new Set<keyof IConfig>([
+  'ai',
+  'commentOptions',
+  'seo',
+  'url',
+])
+
+const s3StorageNullDefaults = {
+  endpoint: '',
+  bucket: '',
+  region: 'auto',
+} as const
+
+function normalizeS3StorageOptionNulls<T extends object>(value: T): T {
+  const normalized = { ...value } as Record<string, unknown>
+
+  for (const [key, defaultValue] of Object.entries(s3StorageNullDefaults)) {
+    if (normalized[key] === null) {
+      normalized[key] = defaultValue
+    }
+  }
+
+  return normalized as T
+}
+
+function isGoogleVertexEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint)
+    return (
+      url.hostname === 'aiplatform.googleapis.com' &&
+      url.pathname.endsWith('/endpoints/openapi')
+    )
+  } catch {
+    return false
+  }
+}
+
+function extractGoogleVertexProjectId(endpoint: string): string | undefined {
+  try {
+    const match = new URL(endpoint).pathname.match(/\/projects\/([^/]+)/)
+    return match?.[1] ? decodeURIComponent(match[1]) : undefined
+  } catch {
+    return undefined
+  }
+}
 
 /*
  * NOTE:
- * 1. 读配置在 Redis 中，getConfig 为收口，获取配置都从 Redis 拿，初始化之后入到 Redis，
- * 2. 对于加密的字段，在 Redis 的缓存中应该也是加密的。
- * 3. 何时解密，在 Node 中消费时，即 getConfig 时统一解密。
+ * 1. Configs live in Redis. `getConfig` is the single entry point; all reads
+ *    come from Redis, and the initial values are loaded into Redis on startup.
+ * 2. Encrypted fields stay encrypted in the Redis cache as well.
+ * 3. Decryption happens at the point of consumption in Node — i.e. uniformly
+ *    inside `getConfig`.
  */
 @Injectable()
-export class ConfigsService {
-  private logger: Logger
+export class ConfigsService implements OnModuleInit {
+  private readonly logger = new Logger(ConfigsService.name)
+  private configInitd = false
+  private configInitPromise?: Promise<void>
+
   constructor(
-    @InjectModel(OptionModel)
-    private readonly optionModel: ReturnModelType<typeof OptionModel>,
+    private readonly optionsRepository: OptionsRepository,
 
     private readonly redisService: RedisService,
-    private readonly subpub: SubPubBridgeService,
+    private readonly configVersionService: ConfigVersionService,
 
     private readonly eventManager: EventManagerService,
+  ) {}
 
-    @Inject(VALIDATION_PIPE_INJECTION)
-    private readonly validate: ExtendedValidationPipe,
-  ) {
-    this.configInit().then(() => {
-      this.logger.log('Config 已经加载完毕！')
-    })
-
-    this.logger = new Logger(ConfigsService.name)
+  async onModuleInit() {
+    await this.ensureConfigInitialized()
+    this.logger.log('Config loaded successfully')
   }
-  private configInitd = false
+
+  private async getRedisClient() {
+    await this.redisService.waitForReady()
+
+    return this.redisService.getClient()
+  }
 
   private async setConfig(config: IConfig) {
-    const redis = this.redisService.getClient()
+    const redis = await this.getRedisClient()
     await redis.set(getRedisKey(RedisKeys.ConfigCache), JSON.stringify(config))
   }
 
-  public async waitForConfigReady() {
-    if (this.configInitd) {
-      return await this.getConfig()
+  private async ensureConfigInitialized(force = false) {
+    if (!force && this.configInitd) {
+      return
     }
 
-    const maxCount = 10
-    let curCount = 0
-    do {
-      if (this.configInitd) {
-        return await this.getConfig()
-      }
-      await sleep(100)
-      curCount += 1
-    } while (curCount < maxCount)
+    if (!force && this.configInitPromise) {
+      await this.configInitPromise
+      return
+    }
 
-    throw `重试 ${curCount} 次获取配置失败, 请检查数据库连接`
+    const initPromise = this.configInit(force)
+      .then(() => {
+        this.configInitd = true
+      })
+      .catch((error) => {
+        this.configInitd = false
+        if (this.configInitPromise === initPromise) {
+          this.configInitPromise = undefined
+        }
+        throw error
+      })
+
+    this.configInitPromise = initPromise
+    await initPromise
+  }
+
+  public async waitForConfigReady() {
+    await this.ensureConfigInitialized()
+    return this.getConfig()
+  }
+
+  public async getOptionValue<T>(name: string, fallback: T): Promise<T> {
+    const value = await this.optionsRepository.get<T>(name)
+    return value ?? fallback
+  }
+
+  public async incrementOption(name: string, delta = 1) {
+    return this.optionsRepository.increment(name, delta)
   }
 
   public get defaultConfig() {
     return generateDefaultConfig()
   }
 
-  protected async configInit() {
-    const configs = await this.optionModel.find().lean()
+  protected async configInit(force = false) {
+    if (!force && this.configInitd) {
+      return
+    }
+
+    const configs = await this.optionsRepository.findAll()
+    const storedAiConfig = configs.find((field) => field.name === 'ai')
+      ?.value as Record<string, any> | undefined
     const mergedConfig = generateDefaultConfig()
+    const mergeStoredConfig = <T extends keyof IConfig>(
+      name: T,
+      value: unknown,
+    ) => {
+      const storedValue =
+        value && typeof value === 'object' ? (value as Partial<IConfig[T]>) : {}
+      mergedConfig[name] = {
+        ...mergedConfig[name],
+        ...storedValue,
+      }
+    }
     configs.forEach((field) => {
       const name = field.name as keyof IConfig
 
@@ -96,51 +193,273 @@ export class ConfigsService {
       if (isDev && name === 'url') {
         return
       }
-      const value = field.value
-      mergedConfig[name] = { ...mergedConfig[name], ...value }
+
+      // Backward-compat: migrate old flat thirdPartyServiceIntegration
+      if (name === 'thirdPartyServiceIntegration') {
+        const normalized = this.normalizeThirdPartyConfig(
+          field.value as Record<string, any>,
+        )
+        mergeStoredConfig(name, normalized)
+      } else if (name === 'membership') {
+        const normalized = this.normalizeMembershipConfig(
+          field.value as Record<string, any>,
+        )
+        mergeStoredConfig(name, normalized)
+      } else {
+        mergeStoredConfig(name, field.value)
+      }
     })
+
+    mergedConfig.ai = this.normalizeAiConfig(
+      storedAiConfig,
+      mergedConfig.ai,
+      mergedConfig.imageGenerationOptions,
+      mergedConfig.ttsOptions,
+    )
 
     await this.setConfig(mergedConfig)
-    this.configInitd = true
   }
 
-  public get<T extends keyof IConfig>(key: T): Promise<Readonly<IConfig[T]>> {
-    return new Promise((resolve, reject) => {
-      this.waitForConfigReady()
-        .then((config) => {
-          resolve(config[key])
-        })
-        .catch(reject)
+  private normalizeAiConfig(
+    storedAiConfig: Record<string, any> | undefined,
+    aiConfig: IConfig['ai'],
+    legacyImageConfig: IConfig['imageGenerationOptions'],
+    legacyTtsConfig: IConfig['ttsOptions'],
+  ): IConfig['ai'] {
+    const providers = (aiConfig.providers ?? []).map((provider) => {
+      const endpoint = provider.endpoint?.trim() ?? ''
+      const isLegacyVertex =
+        provider.type === AIProviderType.OpenAICompatible &&
+        isGoogleVertexEndpoint(endpoint)
+      return {
+        ...provider,
+        ...(isLegacyVertex
+          ? {
+              type: AIProviderType.GoogleVertex,
+              modelListUrl: undefined,
+            }
+          : {}),
+        projectId: provider.projectId ?? extractGoogleVertexProjectId(endpoint),
+        capabilities: isLegacyVertex
+          ? { text: true, image: true, speech: true }
+          : {
+              text: provider.capabilities?.text ?? true,
+              image: provider.capabilities?.image ?? false,
+              speech: provider.capabilities?.speech ?? false,
+            },
+      }
     })
+
+    if (storedAiConfig?.version === 2) {
+      return { ...aiConfig, version: 2, providers }
+    }
+
+    const imageGeneration = {
+      enable: legacyImageConfig.enable,
+      model: undefined as { providerId: string; model?: string } | undefined,
+      defaultAspectRatio: legacyImageConfig.defaultAspectRatio,
+      defaultQuality: legacyImageConfig.defaultQuality,
+      defaultFormat: legacyImageConfig.defaultFormat,
+    }
+    const tts = {
+      enable: legacyTtsConfig.enable,
+      model: undefined as { providerId: string; model?: string } | undefined,
+      voice: legacyTtsConfig.voice,
+      speed: legacyTtsConfig.speed,
+      maxCharsPerChunk: legacyTtsConfig.maxCharsPerChunk,
+      concurrency: legacyTtsConfig.concurrency,
+      maxCharsPerRun: legacyTtsConfig.maxCharsPerRun,
+    }
+
+    const addLegacyProvider = (input: {
+      apiKey?: string | null
+      capability: 'image' | 'speech'
+      defaultModel?: string | null
+      endpoint?: string | null
+      id: string
+      name: string
+    }): string | undefined => {
+      if (!input.apiKey) return undefined
+
+      const normalizedEndpoint = input.endpoint?.trim().replace(/\/+$/, '')
+      const existing = providers.find(
+        (provider) =>
+          provider.apiKey === input.apiKey &&
+          provider.endpoint?.trim().replace(/\/+$/, '') === normalizedEndpoint,
+      )
+      if (existing) {
+        existing.capabilities = {
+          text: existing.capabilities?.text ?? true,
+          image: existing.capabilities?.image || input.capability === 'image',
+          speech:
+            existing.capabilities?.speech || input.capability === 'speech',
+        }
+        return existing.id
+      }
+
+      let id = input.id
+      let suffix = 2
+      while (providers.some((provider) => provider.id === id)) {
+        id = `${input.id}-${suffix}`
+        suffix += 1
+      }
+
+      providers.push({
+        id,
+        name: input.name,
+        type: AIProviderType.OpenAICompatible,
+        apiKey: input.apiKey,
+        endpoint: normalizedEndpoint,
+        projectId: undefined,
+        defaultModel: input.defaultModel ?? '',
+        enabled: true,
+        capabilities: {
+          text: false,
+          image: input.capability === 'image',
+          speech: input.capability === 'speech',
+        },
+      })
+      return id
+    }
+
+    const imageProviderId = addLegacyProvider({
+      apiKey: legacyImageConfig.apiKey,
+      capability: 'image',
+      defaultModel: legacyImageConfig.model,
+      endpoint:
+        legacyImageConfig.endpoint ||
+        (legacyImageConfig.provider === 'openrouter'
+          ? 'https://openrouter.ai/api/v1'
+          : undefined),
+      id: '__legacy_image_generation__',
+      name: 'Imported image generation provider',
+    })
+    if (imageProviderId && legacyImageConfig.model) {
+      imageGeneration.model = {
+        providerId: imageProviderId,
+        model: legacyImageConfig.model,
+      }
+    }
+
+    const ttsProviderId = addLegacyProvider({
+      apiKey: legacyTtsConfig.apiKey,
+      capability: 'speech',
+      defaultModel: legacyTtsConfig.model,
+      endpoint:
+        legacyTtsConfig.endpoint ||
+        (legacyTtsConfig.provider === 'openrouter'
+          ? 'https://openrouter.ai/api/v1'
+          : legacyTtsConfig.provider === 'openai'
+            ? 'https://api.openai.com/v1'
+            : undefined),
+      id: '__legacy_tts__',
+      name: 'Imported speech provider',
+    })
+    if (ttsProviderId && legacyTtsConfig.model) {
+      tts.model = {
+        providerId: ttsProviderId,
+        model: legacyTtsConfig.model,
+      }
+    }
+
+    return {
+      ...aiConfig,
+      version: 2,
+      providers,
+      imageGeneration,
+      tts,
+    }
   }
 
-  // Config 在此收口
+  /**
+   * Backward-compat: migrate old flat { githubToken } to new nested
+   * { github: { enabled, token } } shape at read time.
+   */
+  private normalizeThirdPartyConfig(
+    raw: Record<string, any>,
+  ): IConfig['thirdPartyServiceIntegration'] {
+    // Already new shape
+    if (raw?.github && typeof raw.github === 'object') {
+      return raw as IConfig['thirdPartyServiceIntegration']
+    }
+    // Old flat shape — convert
+    return {
+      github: { enabled: true, token: raw.githubToken || '' },
+      tmdb: { enabled: false, apiKey: '' },
+      bangumi: { enabled: true, accessToken: '' },
+      neodb: { enabled: true },
+      arxiv: { enabled: true },
+      leetcode: { enabled: true },
+      neteaseMusic: { enabled: true },
+      qqMusic: { enabled: true },
+    } as IConfig['thirdPartyServiceIntegration']
+  }
+
+  private normalizeMembershipConfig(
+    raw: Record<string, any>,
+  ): IConfig['membership'] {
+    const { dodoApiKey, dodoEnvironment, dodoWebhookKey, ...providerConfig } =
+      raw
+
+    return {
+      ...providerConfig,
+      apiKey: providerConfig.apiKey ?? dodoApiKey ?? '',
+      webhookSigningKey:
+        providerConfig.webhookSigningKey ?? dodoWebhookKey ?? '',
+      environment: providerConfig.environment ?? dodoEnvironment ?? 'live_mode',
+    } as IConfig['membership']
+  }
+
+  public async get<T extends keyof IConfig>(
+    key: T,
+  ): Promise<Readonly<IConfig[T]>> {
+    const config = await this.waitForConfigReady()
+    return config[key]
+  }
+
+  // Single entry point for config reads
   public async getConfig(errorRetryCount = 3): Promise<Readonly<IConfig>> {
-    const configCache = await this.redisService
-      .getClient()
-      .get(getRedisKey(RedisKeys.ConfigCache))
+    await this.ensureConfigInitialized()
+
+    const redis = await this.getRedisClient()
+    const configCache = await redis.get(getRedisKey(RedisKeys.ConfigCache))
 
     if (configCache) {
       try {
-        const instanceConfigsValue = plainToInstance<IConfig, any>(
-          IConfig as any,
-          JSON.parse(configCache) as any,
-        ) as any as IConfig
-
-        return decryptObject(instanceConfigsValue)
+        const configValue = JSON.parse(configCache) as IConfig
+        return decryptObject(configValue)
       } catch (error) {
-        await this.configInit()
+        await this.ensureConfigInitialized(true)
         if (errorRetryCount > 0) {
-          return await this.getConfig(--errorRetryCount)
+          return await this.getConfig(errorRetryCount - 1)
         }
-        this.logger.error('获取配置失败')
+        this.logger.error('Failed to load config')
         throw error
       }
     } else {
-      await this.configInit()
+      await this.ensureConfigInitialized(true)
 
       return await this.getConfig()
     }
+  }
+
+  /**
+   * Get config with encrypted fields removed (for API response)
+   */
+  public async getConfigForResponse(): Promise<Readonly<IConfig>> {
+    const config = await this.getConfig()
+    return sanitizeConfigForResponse(config)
+  }
+
+  /**
+   * Get a specific config section with encrypted fields removed (for API response)
+   */
+  public async getForResponse<T extends keyof IConfig>(
+    key: T,
+  ): Promise<Readonly<IConfig[T]>> {
+    const config = await this.waitForConfigReady()
+    const value = config[key]
+    return sanitizeConfigForResponse(value as object, key) as IConfig[T]
   }
 
   private async patch<T extends keyof IConfig>(
@@ -148,25 +467,28 @@ export class ConfigsService {
     data: Partial<IConfig[T]>,
   ): Promise<IConfig[T]> {
     const config = await this.getConfig()
-    const updatedConfigRow = await this.optionModel
-      .findOneAndUpdate(
-        { name: key as string },
-        {
-          value: mergeWith(cloneDeep(config[key]), data, (old, newer) => {
-            // 数组不合并
-            if (Array.isArray(old)) {
-              return newer
-            }
-            // 对象合并
-            if (typeof old === 'object' && typeof newer === 'object') {
-              return { ...old, ...newer }
-            }
-          }),
-        },
-        { upsert: true, new: true },
-      )
-      .lean()
-    const newData = updatedConfigRow.value
+    const updatedConfigRow = await this.optionsRepository.upsert(
+      key as string,
+      mergeWith(cloneDeep(config[key]), data, (old, newer, field) => {
+        if (newer === null) {
+          return null
+        }
+        // Arrays are not merged
+        if (Array.isArray(old)) {
+          return newer
+        }
+        // seo.i18n is replaced wholesale, otherwise a shallow object merge
+        // could never drop a locale key that was removed in the patch
+        if (field === 'i18n') {
+          return newer
+        }
+        // Objects are merged
+        if (typeof old === 'object' && typeof newer === 'object') {
+          return { ...old, ...newer }
+        }
+      }),
+    )
+    const newData = updatedConfigRow.value as IConfig[T]
     const mergedFullConfig = Object.assign({}, config, { [key]: newData })
 
     await this.setConfig(mergedFullConfig)
@@ -181,71 +503,126 @@ export class ConfigsService {
     return newData
   }
 
+  private async notifyAggregateConfigUpdate<T extends keyof IConfig>(key: T) {
+    if (!aggregateConfigKeys.has(key)) {
+      return
+    }
+
+    await Promise.all([
+      this.eventManager.emit(EventBusEvents.CleanAggregateCache, null, {
+        scope: EventScope.TO_SYSTEM,
+      }),
+      this.eventManager.emit(
+        BusinessEvents.AGGREGATE_UPDATE,
+        {
+          source: 'config',
+          keys: [key],
+        },
+        {
+          scope: EventScope.TO_SYSTEM,
+        },
+      ),
+    ])
+  }
+
   async patchAndValid<T extends keyof IConfig>(
     key: T,
     value: Partial<IConfig[T]>,
   ) {
     value = camelcaseKeys(value) as any
+    value = removeEmptyEncryptedFields(value as object, key) as Partial<
+      IConfig[T]
+    >
+
+    if (key === 'backupOptions' || key === 'imageStorageOptions') {
+      value = normalizeS3StorageOptionNulls(value)
+    }
+
+    if (key === 'ai') {
+      value = await this.hydrateAiProviderApiKeys(value as any)
+    }
 
     const dto = configDtoMapping[key]
     if (!dto) {
-      throw new BadRequestException('设置不存在')
+      throw createAppException(AppErrorCode.CONFIG_NOT_FOUND, {
+        id: key as string,
+      })
     }
-
-    // 如果是评论设置，并且尝试启用 AI 审核，就检查 AI 配置
+    // If this is the comment settings and AI review is being enabled, validate the AI config
     if (key === 'commentOptions' && (value as any).aiReview === true) {
       const aiConfig = await this.get('ai')
-      const { openAiEndpoint, openAiKey } = aiConfig
-      if (!openAiEndpoint || !openAiKey) {
-        throw new BadRequestException(
-          'OpenAI API Key/Endpoint 未设置，无法启用 AI 评论审核',
-        )
+      const hasEnabledProvider = aiConfig.providers?.some(
+        (p) => p.enabled && (p.capabilities?.text ?? true),
+      )
+      if (!hasEnabledProvider) {
+        throw createAppException(AppErrorCode.AI_PROVIDER_DISABLED)
       }
     }
+    const instanceValue = this.validWithDto(dto, value) as Partial<IConfig[T]>
 
-    const instanceValue = this.validWithDto(dto, value)
+    if (key === 'ai') {
+      const nextConfig = await this.buildNextConfigForValidation(
+        key,
+        instanceValue,
+      )
+      this.validateAiFeatureRoutes(nextConfig.ai)
+    }
 
-    encryptObject(instanceValue)
+    if (key === 'mailOptions') {
+      const nextConfig = await this.buildNextConfigForValidation(
+        key,
+        instanceValue,
+      )
+      this.validateMailProvider(nextConfig)
+    }
+
+    if (key === 'imageGenerationOptions') {
+      const nextConfig = await this.buildNextConfigForValidation(
+        key,
+        instanceValue,
+      )
+      this.validateImageGenerationProvider(nextConfig)
+    }
+
+    if (key === 'ttsOptions') {
+      const nextConfig = await this.buildNextConfigForValidation(
+        key,
+        instanceValue,
+      )
+      this.validateTtsProvider(nextConfig)
+    }
+
+    if (key !== 'oauth') {
+      encryptObject(instanceValue, key)
+    }
 
     switch (key) {
       case 'url': {
-        const newValue = await this.patch(key, instanceValue)
-        this.subpub.publish(EventBusEvents.AppUrlChanged, newValue)
+        const newValue = await this.patch(key, instanceValue as any)
+        await this.configVersionService.bump(ConfigVersionScopes.Url)
+        await this.notifyAggregateConfigUpdate(key)
         return newValue
       }
       case 'mailOptions': {
-        const option = await this.patch(key as 'mailOptions', instanceValue)
-        if (option.enable) {
-          if (cluster.isPrimary) {
-            this.eventManager.emit(EventBusEvents.EmailInit, null, {
-              scope: EventScope.TO_SYSTEM,
-            })
-          } else {
-            this.subpub.publish(EventBusEvents.EmailInit, '')
-          }
-        }
-
-        return option
-      }
-
-      case 'algoliaSearchOptions': {
         const option = await this.patch(
-          key as 'algoliaSearchOptions',
-          instanceValue,
+          key as 'mailOptions',
+          instanceValue as any,
         )
-        if (option.enable) {
-          this.eventManager.emit(EventBusEvents.PushSearch, null, {
-            scope: EventScope.TO_SYSTEM,
-          })
-        }
+        await this.configVersionService.bump(ConfigVersionScopes.Mail)
+        await this.eventManager.emit(EventBusEvents.EmailInit, null, {
+          scope: EventScope.TO_SYSTEM,
+        })
+
         return option
       }
-
       case 'oauth': {
-        const value = instanceValue as OAuthDto
+        const value = instanceValue as unknown as OAuthConfig
         const current = await this.get('oauth')
 
-        const currentProvidersMap = current.providers.reduce(
+        const currentProviders = (current.providers || []).map((provider) => ({
+          ...provider,
+        }))
+        const currentProvidersMap = currentProviders.reduce(
           (acc, item) => {
             acc[item.type] = item
             return acc
@@ -253,52 +630,281 @@ export class ConfigsService {
           {} as Record<string, any>,
         )
 
-        value.providers.forEach((p) => {
+        ;(value.providers || []).forEach((p) => {
           if (!currentProvidersMap[p.type]) {
-            current.providers.push(p)
+            currentProviders.push(p)
           } else {
             Object.assign(currentProvidersMap[p.type], p)
           }
         })
 
-        let nextAuthSecrets = value.secrets
-        if (value.secrets) {
-          nextAuthSecrets = merge(current.secrets, nextAuthSecrets)
+        const nextOauth = {
+          providers: currentProviders,
+          public: merge(cloneDeep(current.public || {}), value.public || {}),
+          secrets: merge(cloneDeep(current.secrets || {}), value.secrets || {}),
         }
+        encryptObject(nextOauth, key)
+        const option = await this.patch(key as 'oauth', nextOauth)
 
-        let nextAuthPublic = value.public
-        if (value.public) {
-          nextAuthPublic = merge(current.public, nextAuthPublic)
-        }
-        const option = await this.patch(key as 'oauth', {
-          providers: current.providers,
-          secrets: nextAuthSecrets,
-          public: nextAuthPublic,
-        })
-
-        this.subpub.publish(EventBusEvents.OauthChanged, option)
+        await this.configVersionService.bump(ConfigVersionScopes.OAuth)
         return option
       }
 
       default: {
-        return this.patch(key, instanceValue)
+        const nextValue = await this.patch(key, instanceValue as any)
+        await this.notifyAggregateConfigUpdate(key)
+        return nextValue
       }
     }
   }
 
-  private validWithDto<T extends object>(dto: ClassConstructor<T>, value: any) {
-    const validModel = plainToInstance(dto, value)
-    const errors = Array.isArray(validModel)
-      ? (validModel as Array<any>).reduce(
-          (acc, item) =>
-            acc.concat(validateSync(item, ExtendedValidationPipe.options)),
-          [],
+  private async buildNextConfigForValidation<T extends keyof IConfig>(
+    key: T,
+    data: Partial<IConfig[T]>,
+  ): Promise<IConfig> {
+    const current = await this.getConfig()
+    const mergedSection = mergeWith(
+      cloneDeep(current[key]),
+      data,
+      (old, newer) => {
+        if (newer === null) {
+          return null
+        }
+        if (Array.isArray(old)) {
+          return newer
+        }
+        if (typeof old === 'object' && typeof newer === 'object') {
+          return { ...old, ...newer }
+        }
+      },
+    )
+    return Object.assign({}, current, { [key]: mergedSection })
+  }
+
+  private validateMailProvider(config: IConfig) {
+    const { mailOptions } = config
+    const errors: string[] = []
+
+    if (mailOptions.provider === 'resend') {
+      // Resend validation: `from` and `apiKey` are required
+      if (!mailOptions.from) {
+        errors.push('mailOptions.from: sender email address must not be empty')
+      }
+      if (!mailOptions.resend?.apiKey) {
+        errors.push(
+          'mailOptions.resend.apiKey: Resend API key must not be empty',
         )
-      : validateSync(validModel, ExtendedValidationPipe.options)
-    if (errors.length > 0) {
-      const error = this.validate.createExceptionFactory()(errors as any[])
-      throw error
+      }
+    } else if (
+      mailOptions.provider === 'smtp' && // SMTP validation: at least one of `user` or `from` is required
+      !mailOptions.smtp?.user &&
+      !mailOptions.from
+    ) {
+      errors.push(
+        'mailOptions.smtp.user or mailOptions.from: at least one sender must be provided',
+      )
     }
-    return validModel
+
+    if (errors.length > 0) {
+      throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+        message: errors.join('; '),
+      })
+    }
+  }
+
+  private validateImageGenerationProvider(config: IConfig) {
+    const { imageGenerationOptions } = config
+
+    if (
+      imageGenerationOptions.provider === 'custom' &&
+      !imageGenerationOptions.endpoint
+    ) {
+      throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+        message:
+          'imageGenerationOptions.endpoint: required when provider is "custom"',
+      })
+    }
+  }
+
+  private validateTtsProvider(config: IConfig) {
+    const { ttsOptions } = config
+
+    if (ttsOptions.provider === 'custom' && !ttsOptions.endpoint) {
+      throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+        message: 'ttsOptions.endpoint: required when provider is "custom"',
+      })
+    }
+  }
+
+  private validateAiFeatureRoutes(aiConfig: IConfig['ai']) {
+    const providerIds = new Set<string>()
+    for (const provider of aiConfig.providers ?? []) {
+      if (providerIds.has(provider.id)) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.providers: duplicate provider id "${provider.id}"`,
+        })
+      }
+      providerIds.add(provider.id)
+    }
+
+    const textAssignments = [
+      ['summaryModel', aiConfig.summaryModel],
+      ['writerModel', aiConfig.writerModel],
+      ['commentReviewModel', aiConfig.commentReviewModel],
+      ['translationModel', aiConfig.translationModel],
+      ['translationReviewModel', aiConfig.translationReviewModel],
+      ['insightsModel', aiConfig.insightsModel],
+      ['insightsTranslationModel', aiConfig.insightsTranslationModel],
+    ] as const
+    for (const [key, assignment] of textAssignments) {
+      if (!assignment?.providerId) continue
+      const provider = aiConfig.providers?.find(
+        (candidate) => candidate.id === assignment.providerId,
+      )
+      if (!provider) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.${key}.providerId: provider "${assignment.providerId}" does not exist`,
+        })
+      }
+      if (!(provider.capabilities?.text ?? true)) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.providers.${provider.id}.capabilities.text: required by ai.${key}`,
+        })
+      }
+      if (!assignment.model?.trim() && !provider.defaultModel.trim()) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.${key}.model: a model or provider default model is required`,
+        })
+      }
+    }
+
+    const mediaAssignments = [
+      ['imageGeneration', 'image', aiConfig.imageGeneration?.model],
+      ['tts', 'speech', aiConfig.tts?.model],
+    ] as const
+    for (const [feature, capability, assignment] of mediaAssignments) {
+      if (!assignment?.providerId) continue
+      const provider = aiConfig.providers?.find(
+        (candidate) => candidate.id === assignment.providerId,
+      )
+      if (!provider) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.${feature}.model.providerId: provider "${assignment.providerId}" does not exist`,
+        })
+      }
+      if (!provider.capabilities?.[capability]) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.providers.${provider.id}.capabilities.${capability}: required by ai.${feature}`,
+        })
+      }
+    }
+
+    const validateRoute = (
+      feature: 'imageGeneration' | 'tts',
+      capability: 'image' | 'speech',
+    ) => {
+      const config = aiConfig[feature]
+      if (!config?.enable) return
+
+      const providerId = config.model?.providerId
+      const provider = aiConfig.providers?.find(
+        (candidate) => candidate.id === providerId,
+      )
+      if (!providerId || !provider || !provider.enabled) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.${feature}.model.providerId: an enabled provider is required`,
+        })
+      }
+      if (!provider.capabilities?.[capability]) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.providers.${provider.id}.capabilities.${capability}: required by ai.${feature}`,
+        })
+      }
+      if (!config.model?.model?.trim()) {
+        throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+          message: `ai.${feature}.model.model: a model is required`,
+        })
+      }
+    }
+
+    validateRoute('imageGeneration', 'image')
+    validateRoute('tts', 'speech')
+
+    if (aiConfig.tts?.enable && !aiConfig.tts.voice) {
+      throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+        message: 'ai.tts.voice: required when TTS is enabled',
+      })
+    }
+  }
+
+  private validWithDto(schema: z.ZodTypeAny, value: unknown): any {
+    const result = schema.safeParse(value)
+    if (!result.success) {
+      const zodError = result.error as ZodError
+      const errorMessages = zodError.issues.map((err) => {
+        const path = err.path.join('.')
+        return path ? `${path}: ${err.message}` : err.message
+      })
+      throw createAppException(AppErrorCode.CONFIG_VALIDATION_FAILED, {
+        message: errorMessages.join('; '),
+      })
+    }
+    return result.data
+  }
+
+  public async getAiProviderById(
+    providerId?: string,
+  ): Promise<AIProviderConfig | null> {
+    if (!providerId) {
+      return null
+    }
+
+    const aiConfig = await this.get('ai')
+    const cachedProvider = aiConfig.providers?.find((p) => p.id === providerId)
+
+    return cachedProvider || null
+  }
+
+  public async resolveAiProviderForCapability(
+    capability: Exclude<AIProviderCapability, 'text'>,
+    assignment?: AIModelAssignment | null,
+  ): Promise<{ model?: string; provider: AIProviderConfig } | null> {
+    if (!assignment?.providerId) return null
+
+    const aiConfig = await this.get('ai')
+    const provider = aiConfig.providers?.find(
+      (candidate) =>
+        candidate.id === assignment.providerId &&
+        candidate.enabled &&
+        candidate.capabilities?.[capability],
+    )
+    if (!provider) return null
+
+    return { model: assignment.model?.trim() || undefined, provider }
+  }
+
+  private async hydrateAiProviderApiKeys(value: any) {
+    if (!value || !Array.isArray(value.providers)) {
+      return value
+    }
+
+    const current = await this.get('ai')
+    if (!current?.providers?.length) {
+      return value
+    }
+
+    const providerMap = new Map(current.providers.map((p) => [p.id, p]))
+    const providers = value.providers.map((provider: any) => {
+      if (provider?.apiKey) {
+        return provider
+      }
+      const existing = providerMap.get(provider?.id)
+      if (existing?.apiKey) {
+        return { ...provider, apiKey: existing.apiKey }
+      }
+      return provider
+    })
+
+    return { ...value, providers }
   }
 }

@@ -1,11 +1,13 @@
-import { encode } from 'blurhash'
-import type { ImageModel } from '~/shared/model/image.model'
+import type { OnModuleInit } from '@nestjs/common'
+import { Injectable, Logger } from '@nestjs/common'
 import type { Sharp } from 'sharp'
-
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
+import { rgbaToThumbHash } from 'thumbhash'
 
 import { ConfigsService } from '~/modules/configs/configs.service'
+import type { ImageModel } from '~/shared/types/legacy-model.type'
 import { pickImagesFromMarkdown } from '~/utils/pic.util'
+import { AsyncQueue } from '~/utils/queue.util'
+import { assertPublicHttpUrl } from '~/utils/ssrf.util'
 import { requireDepsWithInstall } from '~/utils/tool.util'
 
 import { HttpService } from './helper.http.service'
@@ -29,7 +31,7 @@ export class ImageService implements OnModuleInit {
 
   async saveImageDimensionsFromMarkdownText(
     text: string,
-    originImages: ImageModel[] | undefined,
+    originImages: unknown[] | null | undefined,
     onUpdate: (images: ImageModel[]) => Promise<any>,
   ) {
     const newImageSrcSet = new Set(pickImagesFromMarkdown(text))
@@ -38,63 +40,65 @@ export class ImageService implements OnModuleInit {
     const result = [] as ImageModel[]
 
     const oldImagesMap = new Map(
-      (originImages ?? []).map((image) => [image.src, { ...image }]),
+      ((originImages ?? []) as ImageModel[]).map((image) => [
+        image.src,
+        { ...image },
+      ]),
     )
 
-    const task = [] as Promise<ImageModel>[]
-    for (const src of newImages) {
+    const queue = new AsyncQueue(2)
+    const imageProcessingTasks = newImages.map((src) => async () => {
       const originImage = oldImagesMap.get(src)
       const keys = new Set(Object.keys(originImage || {}))
 
-      // 原有图片 和 现有图片 src 一致 跳过
+      // Skip if the existing image and the new image share the same src
       if (
         originImage &&
         originImage.src === src &&
-        ['height', 'width', 'type', 'accent', 'blurHash'].every(
+        ['height', 'width', 'type', 'accent', 'thumbhash'].every(
           (key) => keys.has(key) && originImage[key],
         )
       ) {
         result.push(originImage)
-        continue
+        return
       }
-      const promise = new Promise<ImageModel>((resolve) => {
+
+      try {
         this.logger.log(`Get --> ${src}`)
-        this.getOnlineImageSizeAndMeta(src)
-          .then(({ size, accent, blurHash }) => {
-            const filename = src.split('/').pop()
-            this.logger.debug(
-              `[${filename}]: height: ${size.height}, width: ${size.width}, accent: ${accent}`,
-            )
+        const { size, accent, thumbhash } =
+          await this.getOnlineImageSizeAndMeta(src)
+        const filename = src.split('/').pop()
+        this.logger.debug(
+          `[${filename}]: height: ${size.height}, width: ${size.width}, accent: ${accent}`,
+        )
 
-            resolve({ ...size, accent, src, blurHash })
+        result.push({ ...size, accent, src, thumbhash })
+      } catch (error) {
+        this.logger.error(`GET --> ${src} ${error.message}`)
+
+        const oldRecord = oldImagesMap.get(src)
+        if (oldRecord) {
+          result.push(oldRecord)
+        } else {
+          result.push({
+            width: undefined,
+            height: undefined,
+            type: undefined,
+            accent: undefined,
+            src: undefined,
+            thumbhash: undefined,
           })
-          .catch((error) => {
-            this.logger.error(`GET --> ${src} ${error.message}`)
+        }
+      }
+    })
 
-            const oldRecord = oldImagesMap.get(src)
-            if (oldRecord) {
-              resolve(oldRecord)
-            } else
-              resolve({
-                width: undefined,
-                height: undefined,
-                type: undefined,
-                accent: undefined,
-                src: undefined,
-                blurHash: undefined,
-              })
-          })
-      })
+    // Add all tasks to the queue and wait for completion
+    const wait = queue.addMultiple(imageProcessingTasks)
+    await wait()
 
-      task.push(promise)
-    }
-    const images = await Promise.all(task)
-    result.push(...images)
-
-    // 老图片不要过滤，记录到列头
-
+    // Keep old images instead of filtering them out — prepend to the list
     if (originImages) {
-      for (const oldImageRecord of originImages) {
+      for (const oldImageRecord of originImages as ImageModel[]) {
         const src = oldImageRecord.src
         if (src && !newImageSrcSet.has(src)) {
           result.unshift(oldImageRecord)
@@ -109,8 +113,17 @@ export class ImageService implements OnModuleInit {
     const {
       url: { webUrl },
     } = await this.configsService.waitForConfigReady()
-    const { data, headers } = await this.httpService.axiosRef.get<any>(image, {
-      responseType: 'arraybuffer',
+    // Markdown image URLs are author-supplied; guard the outbound fetch and
+    // disable redirect following so a public host cannot 30x us into one.
+    await assertPublicHttpUrl(image, { allowHttp: true })
+    const response = await this.httpService.fetch.raw<
+      ArrayBuffer,
+      'arrayBuffer'
+    >(image, {
+      responseType: 'arrayBuffer',
+      timeout: 10_000,
+      redirect: 'error',
+      retry: 0,
       headers: {
         'user-agent':
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 11_1_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36',
@@ -118,9 +131,9 @@ export class ImageService implements OnModuleInit {
       },
     })
 
-    const imageType = headers['content-type']!
+    const imageType = response.headers.get('content-type') ?? ''
 
-    const buffer = Buffer.from(data)
+    const buffer = Buffer.from(response._data as ArrayBuffer)
     const sharp = await requireDepsWithInstall('sharp')
     const sharped = sharp(buffer) as Sharp
     const metadata = await sharped.metadata()
@@ -135,21 +148,21 @@ export class ImageService implements OnModuleInit {
     // r g b number to hex
     const accent = `#${dominant.r.toString(16).padStart(2, '0')}${dominant.g.toString(16).padStart(2, '0')}${dominant.b.toString(16).padStart(2, '0')}`
 
-    const blurHash = await encodeImageToBlurhash(sharped)
+    const thumbhash = await encodeImageToThumbhash(sharped)
 
-    return { size, accent, blurHash }
+    return { size, accent, thumbhash }
   }
 }
 
-const encodeImageToBlurhash = (sharped: Sharp) =>
+const encodeImageToThumbhash = (sharped: Sharp) =>
   new Promise<string>((resolve, reject) => {
     sharped
       .raw()
       .ensureAlpha()
-      .resize(32, 32, { fit: 'inside' })
+      .resize(100, 100, { fit: 'inside' })
       .toBuffer((err, buffer, { width, height }) => {
         if (err) return reject(err)
-
-        resolve(encode(new Uint8ClampedArray(buffer), width, height, 4, 4))
+        const u8 = rgbaToThumbHash(width, height, buffer)
+        resolve(Buffer.from(u8).toString('base64'))
       })
   })

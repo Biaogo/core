@@ -1,97 +1,126 @@
-import { Document } from 'mongodb'
-import { Types } from 'mongoose'
-
 import { Injectable } from '@nestjs/common'
-import { ReturnModelType } from '@typegoose/typegoose'
 
-import { DatabaseService } from '~/processors/database/database.service'
-import { InjectModel } from '~/transformers/model.transformer'
+import { AppErrorCode, createAppException } from '~/common/errors'
 
-import { AUTH_JS_USER_COLLECTION } from '../auth/auth.constant'
-import { ReaderModel } from './reader.model'
+import { AuthService } from '../auth/auth.service'
+import type { ReaderRoleFilter } from './reader.repository'
+import { ReaderRepository } from './reader.repository'
+import type {
+  ReaderMembershipStatusFilter,
+  ReaderMembershipSummary,
+  ReaderModel,
+  ReaderRow,
+} from './reader.types'
+
+type ReaderShape = ReaderModel & {
+  id: string
+  email: string | null
+  emailVerified: boolean
+  name: string | null
+  handle: string | null
+  image: string | null
+  role: 'reader' | 'owner'
+  username: string | null
+  displayUsername: string | null
+  bannedAt: Date | null
+  banReason: string | null
+  createdAt: Date
+  updatedAt: Date | null
+  lastLoginAt: Date | null
+  membership: ReaderMembershipSummary | null
+}
 
 @Injectable()
 export class ReaderService {
   constructor(
-    private readonly databaseService: DatabaseService,
-    @InjectModel(ReaderModel)
-    private readonly readerModel: ReturnModelType<typeof ReaderModel>,
+    private readonly authService: AuthService,
+    private readonly readerRepository: ReaderRepository,
   ) {}
 
-  private buildQueryPipeline(where?: Record<string, any>): Document[] {
-    const basePipeline: Document[] = [
-      {
-        $lookup: {
-          from: 'accounts',
-          localField: '_id',
-          foreignField: 'userId',
-          as: 'account',
-        },
-      },
-      {
-        // flat account array
-        $unwind: '$account',
-      },
+  private toReaderShape(row: ReaderRow): ReaderShape {
+    return {
+      ...row,
+      role: row.role as 'reader' | 'owner',
+      bannedAt: row.bannedAt ?? null,
+      banReason: row.banReason ?? null,
+      lastLoginAt: row.lastLoginAt ?? null,
+      membership: row.membership ?? null,
+    } as ReaderShape
+  }
 
-      {
-        $project: {
-          _id: 1,
-          email: 1,
-          isOwner: 1,
-          image: 1,
-          name: 1,
-          handle: 1,
-          account: {
-            _id: 1,
-            type: 1,
-            provider: 1,
-          },
-        },
-      },
+  async find() {
+    const result = await this.readerRepository.list({ page: 1, size: 100 })
+    return result.data.map((row) => this.toReaderShape(row))
+  }
 
-      // account field flat to root level
-      {
-        $replaceRoot: {
-          newRoot: {
-            $mergeObjects: ['$account', '$$ROOT'],
-          },
-        },
-      },
-      {
-        $project: {
-          account: 0,
-        },
-      },
-    ]
+  async findPaginated(
+    page: number,
+    size: number,
+    search?: string,
+    role?: ReaderRoleFilter,
+    membershipStatus?: ReaderMembershipStatusFilter,
+  ) {
+    const result = await this.readerRepository.list({
+      page,
+      size,
+      search,
+      role,
+      membershipStatus,
+    })
 
-    if (where) {
-      basePipeline.push({
-        $match: where,
+    return {
+      data: result.data.map((row) => this.toReaderShape(row)),
+      pagination: result.pagination,
+    }
+  }
+
+  async getById(id: string) {
+    const row = await this.readerRepository.findByIdDetailed(id)
+    if (!row) {
+      throw createAppException(AppErrorCode.AUTH_USER_ID_NOT_FOUND)
+    }
+    return this.toReaderShape(row)
+  }
+
+  async getStats() {
+    return this.readerRepository.countByRole()
+  }
+
+  async banReader(id: string, reason?: string) {
+    const reader = await this.readerRepository.findByIdDetailed(id)
+    if (!reader) {
+      throw createAppException(AppErrorCode.AUTH_USER_ID_NOT_FOUND)
+    }
+    if (reader.role === 'owner') {
+      throw createAppException(AppErrorCode.INVALID_PARAMETER, {
+        message: 'cannot ban owner',
       })
     }
-    return basePipeline
+    await this.readerRepository.setBanned(id, {
+      bannedAt: new Date(),
+      banReason: reason ?? null,
+    })
+    await this.readerRepository.deleteSessionsForUser(id)
+    return this.getById(id)
   }
-  find() {
-    return this.databaseService.db
-      .collection(AUTH_JS_USER_COLLECTION)
-      .aggregate(this.buildQueryPipeline())
-      .toArray()
+
+  async unbanReader(id: string) {
+    const reader = await this.readerRepository.findByIdDetailed(id)
+    if (!reader) {
+      throw createAppException(AppErrorCode.AUTH_USER_ID_NOT_FOUND)
+    }
+    await this.readerRepository.unsetBanned(id)
+    return this.getById(id)
   }
-  async updateAsOwner(id: string) {
-    return this.databaseService.db
-      .collection(AUTH_JS_USER_COLLECTION)
-      .updateOne({ _id: new Types.ObjectId(id) }, { $set: { isOwner: true } })
+
+  async transferOwner(id: string) {
+    return this.authService.transferOwnerRole(id)
   }
   async revokeOwner(id: string) {
-    return this.databaseService.db
-      .collection(AUTH_JS_USER_COLLECTION)
-      .updateOne({ _id: new Types.ObjectId(id) }, { $set: { isOwner: false } })
+    return this.authService.revokeOwnerRole(id)
   }
   async findReaderInIds(ids: string[]) {
-    return this.readerModel
-      .find({
-        _id: { $in: ids.map((id) => new Types.ObjectId(id)) },
-      })
-      .lean()
+    const rows = await this.readerRepository.findByIds(ids)
+    return rows.map((row) => this.toReaderShape(row))
   }
 }

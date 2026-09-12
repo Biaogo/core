@@ -1,174 +1,164 @@
-import { mongo } from 'mongoose'
-import pluralize from 'pluralize'
+import { forwardRef, Inject, Injectable } from '@nestjs/common'
 
-import {
-  BadRequestException,
-  forwardRef,
-  Inject,
-  Injectable,
-  UnprocessableEntityException,
-} from '@nestjs/common'
-
-import { CannotFindException } from '~/common/exceptions/cant-find.exception'
+import { RequestContext } from '~/common/contexts/request.context'
+import { AppErrorCode, createAppException } from '~/common/errors'
 import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { RedisKeys } from '~/constants/cache.constant'
 import { CollectionRefTypes } from '~/constants/db.constant'
 import { DatabaseService } from '~/processors/database/database.service'
 import { EventManagerService } from '~/processors/helper/helper.event.service'
 import { RedisService } from '~/processors/redis/redis.service'
-import { InjectModel } from '~/transformers/model.transformer'
 import { getRedisKey } from '~/utils/redis.util'
 import { scheduleManager } from '~/utils/schedule.util'
 
-import { CommentState } from '../comment/comment.model'
 import { CommentService } from '../comment/comment.service'
-import { ConfigsService } from '../configs/configs.service'
-import { RecentlyAttitudeEnum } from './recently.dto'
-import { RecentlyModel } from './recently.model'
+import { EnrichmentService } from '../enrichment/enrichment.service'
+import type { EnrichmentResult } from '../enrichment/enrichment.types'
+import { UrlExtractorService } from '../enrichment/url-extractor.service'
+import { RecentlyRepository } from './recently.repository'
+import { RecentlyAttitudeEnum, RecentlyTypeEnum } from './recently.schema'
+import { type RecentlyCreateModel, type RecentlyRow } from './recently.types'
 
-const { ObjectId } = mongo
+type EnrichmentMap = Record<string, EnrichmentResult>
+
+/**
+ * Minimal hydrated reference returned alongside a recently row when its
+ * `refType`/`refId` point at a post/note/page/recently. Mirrors the small
+ * surface that admin and Yohaku consumers actually read from `item.ref`.
+ */
+export type RecentlyRefSummary = {
+  id: string
+  type: CollectionRefTypes
+  title?: string
+  slug?: string | null
+  nid?: number
+  url?: string
+}
+
+export type RecentlyWithRef = RecentlyRow & { ref?: RecentlyRefSummary | null }
 
 @Injectable()
 export class RecentlyService {
   constructor(
-    @InjectModel(RecentlyModel)
-    private readonly recentlyModel: MongooseModel<RecentlyModel>,
+    private readonly recentlyRepository: RecentlyRepository,
     private readonly eventManager: EventManagerService,
     private readonly databaseService: DatabaseService,
     private readonly redisService: RedisService,
     @Inject(forwardRef(() => CommentService))
     private readonly commentService: CommentService,
-    private readonly configsService: ConfigsService,
+    @Inject(forwardRef(() => EnrichmentService))
+    private readonly enrichmentService: EnrichmentService,
+    private readonly urlExtractor: UrlExtractorService,
   ) {}
 
-  public get model() {
-    return this.recentlyModel
+  public get repository() {
+    return this.recentlyRepository
+  }
+
+  async findById(id: string) {
+    const row = await this.recentlyRepository.findById(id)
+    if (!row) return row
+    const withCount = await this.attachCommentCount([row])
+    const [withRef] = await this.attachRef(withCount)
+    const [withEnrichment] = await this.attachEnrichments([withRef])
+    return withEnrichment
+  }
+
+  async findRecent(size: number) {
+    const rows = await this.recentlyRepository.findRecent(size)
+    const withRef = await this.attachRef(await this.attachCommentCount(rows))
+    return this.attachEnrichments(withRef)
+  }
+
+  async count() {
+    return this.recentlyRepository.count()
   }
 
   async getAll() {
-    const result = (await this.model.aggregate([
-      {
-        $lookup: {
-          from: 'comments',
-          as: 'comment',
-          foreignField: 'ref',
-          localField: '_id',
-        },
-      },
-
-      {
-        $addFields: {
-          comments: {
-            $size: '$comment',
-          },
-        },
-      },
-      {
-        $project: {
-          comment: 0,
-        },
-      },
-      {
-        $sort: {
-          created: -1,
-        },
-      },
-    ])) as RecentlyModel[]
-
-    await this.populateRef(result)
-
-    return result
+    const result = await this.recentlyRepository.list(1, 50)
+    const withRef = await this.attachRef(
+      await this.attachCommentCount(result.data),
+    )
+    return this.attachEnrichments(withRef)
   }
 
   async getOne(id: string) {
-    const result = (await this.model.aggregate([
-      {
-        $lookup: {
-          from: 'comments',
-          as: 'comment',
-          foreignField: 'ref',
-          localField: '_id',
-        },
-      },
-
-      {
-        $addFields: {
-          comments: {
-            $size: '$comment',
-          },
-        },
-      },
-      {
-        $project: {
-          comment: 0,
-        },
-      },
-      {
-        $sort: {
-          created: -1,
-        },
-      },
-      {
-        $match: {
-          _id: new ObjectId(id),
-        },
-      },
-    ])) as RecentlyModel[]
-
-    await this.populateRef(result)
-
-    return result[0] || null
+    return this.findById(id)
   }
-  async populateRef(result: RecentlyModel[], omit = ['text']) {
-    const refMap: Record<
-      Exclude<CollectionRefTypes, CollectionRefTypes.Recently>,
-      string[]
-    > = {
-      [CollectionRefTypes.Post]: [],
-      [CollectionRefTypes.Page]: [],
-      [CollectionRefTypes.Note]: [],
-    }
-    for (const doc of result) {
-      if (!doc.refType) {
-        continue
-      }
-      refMap[doc.refType]?.push(doc.ref)
-    }
 
-    const foreignIdMap = {} as any
-
-    for (const refType in refMap) {
-      const refIds = refMap[refType as CollectionRefTypes]
-      if (refIds.length === 0) {
-        continue
-      }
-      const cursor = await this.databaseService.db
-        .collection(pluralize(refType).toLowerCase())
-        .find({
-          _id: {
-            $in: refIds,
-          },
-        })
-
-      for await (const doc of cursor) {
-        foreignIdMap[doc._id.toHexString()] = Object.assign({}, doc)
-      }
+  /**
+   * Resolve `refType`/`refId` on each row to a small joined `ref` summary.
+   * Batched via `databaseService.findGlobalByIds` to avoid N+1.
+   *
+   * Rows whose `refId` is null get `ref: null`. Rows whose ref points at a
+   * deleted entity also get `ref: null` (orphan refs must never crash the
+   * response).
+   */
+  private async attachRef<T extends RecentlyRow>(
+    rows: T[],
+  ): Promise<Array<T & { ref?: RecentlyRefSummary | null }>> {
+    if (rows.length === 0) return []
+    const refIds = [
+      ...new Set(
+        rows
+          .map((r) => r.refId)
+          .filter((id): id is NonNullable<typeof id> => !!id)
+          .map(String),
+      ),
+    ]
+    if (refIds.length === 0) {
+      return rows.map((row) => ({
+        ...row,
+        ref: row.refId ? null : undefined,
+      }))
     }
 
-    for (const doc of result) {
-      if (!doc.refType) {
-        continue
-      }
+    const collection = await this.databaseService.findGlobalByIds(refIds)
+    const flat = this.databaseService.flatCollectionToMap(collection)
+    const typeMap = new Map<string, CollectionRefTypes>()
+    for (const item of collection.posts)
+      typeMap.set(item.id, CollectionRefTypes.Post)
+    for (const item of collection.notes)
+      typeMap.set(item.id, CollectionRefTypes.Note)
+    for (const item of collection.pages)
+      typeMap.set(item.id, CollectionRefTypes.Page)
+    for (const item of collection.recentlies)
+      typeMap.set(item.id, CollectionRefTypes.Recently)
 
-      const hasRef = foreignIdMap[(doc.ref as any)?.toHexString()]
-      if (hasRef) {
-        for (const field of omit) {
-          Reflect.deleteProperty(hasRef, field)
-        }
-        doc.ref = hasRef
-      }
+    return rows.map((row) => {
+      if (!row.refId) return { ...row, ref: undefined }
+      const refIdStr = String(row.refId)
+      const doc = flat[refIdStr]
+      const type = typeMap.get(refIdStr)
+      if (!doc || !type) return { ...row, ref: null }
+      return { ...row, ref: this.buildRefSummary(type, doc) }
+    })
+  }
+
+  private buildRefSummary(
+    type: CollectionRefTypes,
+    doc: any,
+  ): RecentlyRefSummary {
+    const summary: RecentlyRefSummary = {
+      id: doc.id,
+      type,
+      title: doc.title,
     }
-    return result
+    if (type === CollectionRefTypes.Note) {
+      summary.nid = doc.nid
+      summary.url = `/notes/${doc.nid}`
+    } else if (type === CollectionRefTypes.Post) {
+      summary.slug = doc.slug
+      const categorySlug = doc.category?.slug
+      if (categorySlug)
+        summary.url = `/posts/${categorySlug}/${encodeURIComponent(doc.slug)}`
+    } else if (type === CollectionRefTypes.Page) {
+      summary.slug = doc.slug
+      summary.url = `/${doc.slug}`
+    } else if (type === CollectionRefTypes.Recently) {
+      summary.url = `/thinking/${doc.id}`
+    }
+    return summary
   }
 
   async getOffset({
@@ -180,158 +170,149 @@ export class RecentlyService {
     size?: number
     after?: string
   }) {
-    size = size ?? 10
-
-    const configs = await this.configsService.get('commentOptions')
-    const { commentShouldAudit } = configs
-
-    const result = await this.recentlyModel.aggregate([
-      {
-        $match: after
-          ? {
-              _id: {
-                $gt: new ObjectId(after),
-              },
-            }
-          : before
-            ? { _id: { $lt: new ObjectId(before) } }
-            : {},
-      },
-
-      {
-        $lookup: {
-          from: 'comments',
-          as: 'comment',
-          foreignField: 'ref',
-          localField: '_id',
-          pipeline: [
-            {
-              $match: commentShouldAudit
-                ? {
-                    state: CommentState.Read,
-                  }
-                : {
-                    $or: [
-                      {
-                        state: CommentState.Read,
-                      },
-                      {
-                        state: CommentState.Unread,
-                      },
-                    ],
-                  },
-            },
-          ],
-        },
-      },
-
-      {
-        $addFields: {
-          comments: {
-            $size: '$comment',
-          },
-        },
-      },
-      {
-        $project: {
-          comment: 0,
-        },
-      },
-      {
-        $sort: {
-          _id: -1,
-        },
-      },
-      { $limit: size },
-    ])
-    await this.populateRef(result)
-    return result
+    const rows = await this.recentlyRepository.findOffset({
+      before,
+      after,
+      size: size ?? 10,
+    })
+    const withRef = await this.attachRef(await this.attachCommentCount(rows))
+    return this.attachEnrichments(withRef)
   }
+
   async getLatestOne() {
-    const latest = await this.model
-      .findOne()
-      .sort({ created: -1 })
-      .populate([
-        {
-          path: 'ref',
-          select: '-text',
-        },
-      ])
-      .lean()
-
-    if (!latest) {
-      return null
-    }
-
-    const commentCount = await this.commentService.model.countDocuments({
-      refType: CollectionRefTypes.Recently,
-      ref: latest._id,
-    })
-
-    return {
-      ...latest,
-      comments: commentCount,
-    }
+    const [latest] = await this.findRecent(1)
+    return latest ?? null
   }
 
-  async create(model: RecentlyModel) {
-    if (model.refId) {
-      const existModel = await this.databaseService.findGlobalById(model.refId)
-      if (!existModel || !existModel.type) {
-        throw new BadRequestException('ref model not found')
-      }
+  async getRefCandidates(search: string, size: number) {
+    const candidates = await this.databaseService.findRefCandidates(
+      search,
+      size,
+    )
+    return candidates.map(({ document, type }) => ({
+      id: String(document.id),
+      type,
+      title:
+        type === CollectionRefTypes.Recently
+          ? this.recentlyCandidateTitle(document.content)
+          : document.title,
+    }))
+  }
 
-      model.refType = existModel.type
+  /**
+   * Stamp `commentsIndex` with the live comment count per row. The persistent
+   * counter column drifts (it is not incremented on comment create), so all
+   * read paths recompute it before returning.
+   */
+  private async attachCommentCount<T extends RecentlyRow>(
+    rows: T[],
+  ): Promise<T[]> {
+    if (rows.length === 0) return rows
+    const ids = rows.map((r) => String(r.id))
+    const map = await this.commentService.countManyByRef(
+      CollectionRefTypes.Recently,
+      ids,
+    )
+    for (const row of rows) {
+      row.commentsIndex = map.get(String(row.id)) ?? 0
+    }
+    return rows
+  }
+
+  async create(model: RecentlyCreateModel) {
+    let refType = model.refType
+    const refId = model.refId ?? model.ref
+    if (refId) {
+      const existModel = await this.databaseService.findGlobalById(refId)
+      if (!existModel || !existModel.type) {
+        throw createAppException(AppErrorCode.REF_MODEL_NOT_FOUND)
+      }
+      refType = existModel.type
     }
 
-    const res = await this.model.create({
-      content: model.content,
-      ref: model.refId,
-      refType: model.refType,
-    })
+    const content = model.content ?? ''
+    const urls = this.urlExtractor.extractFromMarkdown(content)
 
-    const withRef = await this.model
-      .findById(res._id)
-      .populate([
-        {
-          path: 'ref',
-          select: '-text',
-        },
-      ])
-      .lean()
-    scheduleManager.schedule(async () => {
-      await this.eventManager.broadcast(
-        BusinessEvents.RECENTLY_CREATE,
-        withRef,
-        {
-          scope: EventScope.TO_SYSTEM_VISITOR,
-        },
-      )
+    const withRef = await this.recentlyRepository.create({
+      content,
+      type: urls.length > 0 ? RecentlyTypeEnum.Link : RecentlyTypeEnum.Text,
+      metadata: model.metadata,
+      refId,
+      refType: refType as any,
     })
-    return withRef
+    await this.warmEnrichments(this.enrichmentUrls(withRef, urls))
+    const [hydrated] = await this.attachEnrichments([withRef])
+    scheduleManager.schedule(async () => {
+      await this.eventManager.emit(BusinessEvents.RECENTLY_CREATE, hydrated, {
+        scope: EventScope.TO_SYSTEM_VISITOR,
+      })
+    })
+    return hydrated
   }
 
   async delete(id: string) {
-    const [{ deletedCount }] = await Promise.all([
-      this.model.deleteOne({
-        _id: id,
-      }),
-      // delete comment ref
-      this.commentService.model.deleteMany({
-        ref: id,
-        refType: CollectionRefTypes.Recently,
-      }),
-    ])
-    const isDeleted = deletedCount === 1
+    const deleted = await this.recentlyRepository.deleteById(id)
+    await this.commentService.deleteForRef(CollectionRefTypes.Recently, id)
+    const isDeleted = !!deleted
     scheduleManager.schedule(async () => {
       if (isDeleted) {
-        await this.eventManager.broadcast(BusinessEvents.RECENTLY_DELETE, id, {
-          scope: EventScope.TO_SYSTEM_VISITOR,
-        })
+        await this.eventManager.emit(
+          BusinessEvents.RECENTLY_DELETE,
+          { id },
+          { scope: EventScope.TO_SYSTEM_VISITOR },
+        )
       }
     })
-
     return isDeleted
+  }
+
+  async update(id: string, model: RecentlyCreateModel) {
+    const contentChanged = model.content !== undefined
+    const urls = contentChanged
+      ? this.urlExtractor.extractFromMarkdown(model.content ?? '')
+      : []
+
+    const hasRefPatch =
+      model.clearRef === true ||
+      Object.hasOwn(model, 'ref') ||
+      Object.hasOwn(model, 'refId')
+    const requestedRefId = model.clearRef ? null : (model.refId ?? model.ref)
+    let refType = model.refType
+    if (hasRefPatch && requestedRefId) {
+      const existingRef = await this.databaseService.findGlobalById(
+        String(requestedRefId),
+      )
+      if (!existingRef || !existingRef.type) {
+        throw createAppException(AppErrorCode.REF_MODEL_NOT_FOUND)
+      }
+      refType = existingRef.type
+    } else if (hasRefPatch && !requestedRefId) {
+      refType = null
+    }
+
+    const withRef = await this.recentlyRepository.update(id, {
+      content: model.content,
+      type: contentChanged
+        ? urls.length > 0
+          ? RecentlyTypeEnum.Link
+          : RecentlyTypeEnum.Text
+        : undefined,
+      metadata: model.metadata,
+      refId: hasRefPatch ? requestedRefId : undefined,
+      refType: hasRefPatch ? (refType as any) : undefined,
+      modifiedAt: new Date(),
+    })
+    if (!withRef) return null
+    if (contentChanged) {
+      await this.warmEnrichments(this.enrichmentUrls(withRef, urls))
+    }
+    const [hydrated] = await this.attachEnrichments([withRef])
+    scheduleManager.schedule(async () => {
+      await this.eventManager.emit(BusinessEvents.RECENTLY_UPDATE, hydrated, {
+        scope: EventScope.TO_SYSTEM_VISITOR,
+      })
+    })
+    return hydrated
   }
 
   async updateAttitude({
@@ -343,56 +324,143 @@ export class RecentlyService {
     attitude: RecentlyAttitudeEnum
     ip: string
   }) {
-    if (!ip) {
-      throw new UnprocessableEntityException('can not got your ip')
-    }
-    const model = await this.model.findById(id)
-
-    if (!model) {
-      throw new CannotFindException()
-    }
-
-    const attitudePath = {
-      [RecentlyAttitudeEnum.Up]: 'up',
-      [RecentlyAttitudeEnum.Down]: 'down',
-    }
+    if (!ip) throw createAppException(AppErrorCode.CANNOT_GET_IP)
+    const model = await this.recentlyRepository.findById(id)
+    if (!model) throw createAppException(AppErrorCode.NOT_FOUND)
 
     const redis = this.redisService.getClient()
+    const redisKey = getRedisKey(RedisKeys.RecentlyAttitude)
     const key = `${id}:${ip}`
-    const currentAttitude = await redis.hget(
-      getRedisKey(RedisKeys.RecentlyAttitude),
-      key,
-    )
+    const currentAttitude = await redis.hget(redisKey, key)
+    const persist = () =>
+      redis.hset(
+        redisKey,
+        key,
+        JSON.stringify({ attitude, date: new Date().toISOString() }),
+      )
 
-    if (currentAttitude) {
-      const { attitude: prevAttitude } = JSON.parse(currentAttitude)
-      // 之前是点了赞，现在还是点赞，取消之前的点赞
-      if (prevAttitude === attitude) {
-        model.$inc(attitudePath[prevAttitude], -1)
-        await redis.hdel(getRedisKey(RedisKeys.RecentlyAttitude), key)
-        // 之前点了赞，现在点了踩，取消之前的点赞，并且踩 +1
-      } else {
-        model.$inc(attitudePath[prevAttitude], -1)
-        model.$inc(attitudePath[attitude], 1)
-        await redis.hset(
-          getRedisKey(RedisKeys.RecentlyAttitude),
-          key,
-          JSON.stringify({ attitude, date: new Date().toISOString() }),
-        )
-      }
-
-      await model.save()
-
-      return prevAttitude === attitude ? -1 : 1
+    if (!currentAttitude) {
+      await this.adjustScore(id, attitude, 1)
+      await persist()
+      return 1
     }
 
-    model.$inc(attitudePath[attitude], 1)
-    await redis.hset(
-      getRedisKey(RedisKeys.RecentlyAttitude),
-      key,
-      JSON.stringify({ attitude, date: new Date().toISOString() }),
-    )
-    await model.save()
+    const { attitude: prevAttitude } = JSON.parse(currentAttitude)
+    if (prevAttitude === attitude) {
+      await this.adjustScore(id, prevAttitude, -1)
+      await redis.hdel(redisKey, key)
+      return -1
+    }
+    await this.switchScore(id, prevAttitude)
+    await persist()
     return 1
+  }
+
+  private async adjustScore(
+    id: string,
+    attitude: RecentlyAttitudeEnum,
+    delta: number,
+  ) {
+    if (attitude === RecentlyAttitudeEnum.Up) {
+      await this.recentlyRepository.incrementUp(id, delta)
+    } else {
+      await this.recentlyRepository.incrementDown(id, delta)
+    }
+  }
+
+  private async switchScore(id: string, prevAttitude: RecentlyAttitudeEnum) {
+    if (prevAttitude === RecentlyAttitudeEnum.Up) {
+      await this.recentlyRepository.incrementUp(id, -1)
+      await this.recentlyRepository.incrementDown(id, 1)
+    } else {
+      await this.recentlyRepository.incrementDown(id, -1)
+      await this.recentlyRepository.incrementUp(id, 1)
+    }
+  }
+
+  /**
+   * Owner-side write path: ensure every URL has a cached enrichment row
+   * before we hydrate and return. Reads the cache first via
+   * {@link EnrichmentService.hydrateUrls} (SWR — DB hit returns immediately,
+   * stale rows trigger async refresh), then synchronously fetches only the
+   * URLs that truly missed. Warm cache → zero network. Cold URL → one fetch.
+   */
+  private async warmEnrichments(urls: readonly string[]): Promise<void> {
+    if (urls.length === 0) return
+    let cached: EnrichmentMap = {}
+    try {
+      cached = await this.enrichmentService.hydrateUrls(
+        urls,
+        RequestContext.currentLang(),
+      )
+    } catch {
+      // hydration probe failure falls through to a full prefetch attempt
+    }
+    const missing = urls.filter((u) => !cached[u])
+    if (missing.length === 0) return
+    try {
+      await this.enrichmentService.prefetchUrls(missing)
+    } catch {
+      // resolve failure must never block the write response
+    }
+  }
+
+  /**
+   * Attach an `enrichments` map keyed by URL to each row. Scans every row's
+   * markdown `content` for single-link-paragraph URLs, hydrates the deduped
+   * union in one batch via {@link EnrichmentService.hydrateUrls}, then maps
+   * each row's own URLs back. Same contract as post/note/page link cards.
+   */
+  private async attachEnrichments<T extends RecentlyRow>(
+    rows: T[],
+  ): Promise<Array<T & { enrichments: EnrichmentMap }>> {
+    if (rows.length === 0) return []
+
+    const urlsByRow = rows.map((row) => {
+      const extracted = this.urlExtractor.extractFromMarkdown(row.content)
+      return this.enrichmentUrls(row, extracted)
+    })
+    const allUrls = [...new Set(urlsByRow.flat())]
+    if (allUrls.length === 0) {
+      return rows.map((row) => ({ ...row, enrichments: {} }))
+    }
+
+    const lang = RequestContext.currentLang()
+    let map: EnrichmentMap = {}
+    try {
+      map = await this.enrichmentService.hydrateUrls(allUrls, lang)
+    } catch {
+      // hydration failure must never crash the list response
+    }
+
+    return rows.map((row, i) => {
+      const enrichments: EnrichmentMap = {}
+      for (const url of urlsByRow[i]) {
+        const result = map[url]
+        if (result) enrichments[url] = result
+      }
+      return { ...row, enrichments }
+    })
+  }
+
+  private enrichmentUrls(
+    row: Pick<RecentlyRow, 'metadata'>,
+    extracted: readonly string[],
+  ): string[] {
+    const selected = row.metadata?.selectedEnrichmentUrls
+    if (!Array.isArray(selected)) return [...extracted]
+    const selectedSet = new Set(
+      selected.filter((value): value is string => typeof value === 'string'),
+    )
+    return extracted.filter((url) => selectedSet.has(url))
+  }
+
+  private recentlyCandidateTitle(content: string): string {
+    const firstLine = content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean)
+    if (!firstLine) return 'Untitled Recently'
+    return firstLine.length > 80 ? `${firstLine.slice(0, 77)}…` : firstLine
   }
 }

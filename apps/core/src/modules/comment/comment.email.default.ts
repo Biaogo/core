@@ -1,6 +1,7 @@
 import dayjs from 'dayjs'
-import type { UserModel, UserModelSecurityKeys } from '../user/user.model'
-import type { CommentModel } from './comment.model'
+
+import type { OwnerModel, OwnerModelSecurityKeys } from '../owner/owner.types'
+import type { CommentModel } from './comment.types'
 
 export interface CommentModelRenderProps {
   author: string
@@ -19,7 +20,7 @@ const defaultCommentModelForRenderProps: CommentModelRenderProps = {
   avatar:
     'https://cloudflare-ipfs.com/ipfs/Qmd3W5DuhgHirLHGVixi6V76LhCkZUz6pnFt5AJBiyvHye/avatar/976.jpg' as string,
   mail: 'commtor@example.com' as string,
-  text: '世界！' as string,
+  text: 'Hello world!' as string,
   ip: '0.0.0.0' as string | undefined,
   agent:
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' as string,
@@ -29,14 +30,14 @@ const defaultCommentModelForRenderProps: CommentModelRenderProps = {
   url: 'https://blog.commentor.com' as string,
 }
 
-export const defaultCommentModelKeys = [
-  ...Object.keys(defaultCommentModelForRenderProps),
-]
+export const defaultCommentModelKeys = Object.keys(
+  defaultCommentModelForRenderProps,
+)
 
 const defaultPostModelForRenderProps = {
-  title: '匆匆',
+  title: 'Sample Post',
   id: 'd7e0ed429da8ae90988c37da',
-  text: '燕子去了，有再来的时候；杨柳枯了，有再青的时候；桃花谢了，有再开的时候。但是，聪明的，你告诉我，我们的日子为什么一去不复返呢？——是有人偷了他们罢：那是谁？又藏在何处呢？是他们自己逃走了罢：如今（现在 [2] ）又到了哪里呢？',
+  text: 'Swallows may have gone, but there is a time of return; willow trees may have died back, but there is a time of regreening; peach blossoms may have fallen, but they will bloom again. But, tell me, you the wise, why should our days leave us, never to return?',
   created: new Date().toISOString(),
   modified: null as string | null,
 }
@@ -50,13 +51,13 @@ export const baseRenderProps = Object.freeze({
 
   time: dayjs().format('YYYY/MM/DD'),
   title: defaultPostModelForRenderProps.title,
-  master: 'innei' as string,
+  owner: 'innei' as string,
 
   aggregate: {
     post: defaultPostModelForRenderProps,
     commentor: defaultCommentModelForRenderProps,
     parent: null as CommentModel | null,
-    owner: {} as Omit<UserModel, UserModelSecurityKeys>,
+    owner: {} as Omit<OwnerModel, OwnerModelSecurityKeys>,
   },
 })
 type Writeable<T> = { -readonly [P in keyof T]: T[P] }

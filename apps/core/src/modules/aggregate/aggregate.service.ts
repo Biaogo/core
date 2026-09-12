@@ -1,72 +1,80 @@
-import { URL } from 'node:url'
-import { pick } from 'lodash'
-import type { ReturnModelType } from '@typegoose/typegoose'
-import type { AnyParamConstructor } from '@typegoose/typegoose/lib/types'
-import type { PipelineStage } from 'mongoose'
-import type { CategoryModel } from '../category/category.model'
-import type { RSSProps } from './aggregate.interface'
-
 import { forwardRef, Inject, Injectable } from '@nestjs/common'
 import { OnEvent } from '@nestjs/event-emitter'
+import dayjs from 'dayjs'
+import utc from 'dayjs/plugin/utc.js'
 
-import {
-  API_CACHE_PREFIX,
-  CacheKeys,
-  RedisKeys,
-} from '~/constants/cache.constant'
+import { CacheKeys, RedisKeys } from '~/constants/cache.constant'
 import { EventBusEvents } from '~/constants/event-bus.constant'
+import {
+  CATEGORY_SERVICE_TOKEN,
+  POST_SERVICE_TOKEN,
+} from '~/constants/injection.constant'
 import { WebEventsGateway } from '~/processors/gateway/web/events.gateway'
 import { UrlBuilderService } from '~/processors/helper/helper.url-builder.service'
+import {
+  getPublicContent,
+  getPublicText,
+} from '~/processors/helper/lexical-truncate.util'
 import { RedisService } from '~/processors/redis/redis.service'
-import { addYearCondition } from '~/transformers/db-query.transformer'
 import { getRedisKey } from '~/utils/redis.util'
 import { getShortDate } from '~/utils/time.util'
 
-import { CategoryService } from '../category/category.service'
-import { CommentState } from '../comment/comment.model'
+import { AnalyzeService } from '../analyze/analyze.service'
+import type { CategoryService } from '../category/category.service'
+import { CommentState } from '../comment/comment.enum'
 import { CommentService } from '../comment/comment.service'
 import { ConfigsService } from '../configs/configs.service'
-import { LinkState } from '../link/link.model'
 import { LinkService } from '../link/link.service'
+import { LinkState } from '../link/link.types'
 import { NoteService } from '../note/note.service'
+import { OwnerService } from '../owner/owner.service'
 import { PageService } from '../page/page.service'
-import { PostService } from '../post/post.service'
+import type { PostService } from '../post/post.service'
 import { RecentlyService } from '../recently/recently.service'
 import { SayService } from '../say/say.service'
-import { UserService } from '../user/user.service'
-import { ReadAndLikeCountDocumentType, TimelineType } from './aggregate.dto'
+import type {
+  DeskSummary,
+  HeatmapDay,
+  OnThisDayEntry,
+  RSSProps,
+} from './aggregate.interface'
+import { ReadAndLikeCountDocumentType, TimelineType } from './aggregate.schema'
+
+dayjs.extend(utc)
+
+const omitArticleBody = <T extends { text?: unknown; content?: unknown }>(
+  row: T,
+): Omit<T, 'text' | 'content'> => {
+  const { text, content, ...rest } = row
+  return rest
+}
 
 @Injectable()
 export class AggregateService {
   constructor(
-    @Inject(forwardRef(() => PostService))
+    @Inject(POST_SERVICE_TOKEN)
     private readonly postService: PostService,
     @Inject(forwardRef(() => NoteService))
     private readonly noteService: NoteService,
-
-    @Inject(forwardRef(() => CategoryService))
+    @Inject(CATEGORY_SERVICE_TOKEN)
     private readonly categoryService: CategoryService,
-
     @Inject(forwardRef(() => PageService))
     private readonly pageService: PageService,
-
     @Inject(forwardRef(() => SayService))
     private readonly sayService: SayService,
-
     @Inject(forwardRef(() => CommentService))
     private readonly commentService: CommentService,
     @Inject(forwardRef(() => LinkService))
     private readonly linkService: LinkService,
     @Inject(forwardRef(() => RecentlyService))
     private readonly recentlyService: RecentlyService,
-
-    @Inject(forwardRef(() => UserService))
-    private readonly userService: UserService,
-    private readonly urlService: UrlBuilderService,
-
+    @Inject(forwardRef(() => OwnerService))
+    private readonly ownerService: OwnerService,
     private readonly configs: ConfigsService,
-    private readonly gateway: WebEventsGateway,
     private readonly redisService: RedisService,
+    private readonly analyzeService: AnalyzeService,
+    private readonly webGateway: WebEventsGateway,
+    private readonly urlBuilder: UrlBuilderService,
   ) {}
 
   getAllCategory() {
@@ -74,61 +82,63 @@ export class AggregateService {
   }
 
   getAllPages() {
-    return this.pageService.model
-      .find({}, 'title _id slug order')
-      .sort({
-        order: -1,
-        modified: -1,
-      })
-      .lean()
-  }
-
-  private findTop<
-    U extends AnyParamConstructor<any>,
-    T extends ReturnModelType<U>,
-  >(model: T, condition = {}, size = 6) {
-    return model
-      .find(condition)
-      .sort({ created: -1 })
-      .limit(size)
-      .select(
-        '_id title name slug avatar nid created meta images tags modified',
-      )
+    return this.pageService.findAll()
   }
 
   async topActivity(size = 6, isAuthenticated = false) {
     const [notes, posts, says, recently] = await Promise.all([
-      this.findTop(
-        this.noteService.model,
-        !isAuthenticated
-          ? {
-              hide: false,
-              password: undefined,
-            }
-          : {},
-        size,
-      ).lean({ getters: true }),
-
-      this.findTop(
-        this.postService.model,
-        !isAuthenticated ? { hide: false } : {},
-        size,
-      )
-        .populate('categoryId')
-        .lean({ getters: true })
-        .then((res) => {
-          return res.map((post) => {
-            post.category = pick(post.categoryId, ['name', 'slug'])
-            delete post.categoryId
-            return post
-          })
-        }),
-
-      this.sayService.model.find({}).sort({ create: -1 }).limit(size),
-      this.recentlyService.model.find({}).sort({ create: -1 }).limit(size),
+      this.noteService.findRecent(size, {
+        visibleOnly: !isAuthenticated,
+        metaOnly: true,
+      }),
+      this.postService.findRecent(size, {
+        publishedOnly: !isAuthenticated,
+        metaOnly: true,
+      }),
+      this.sayService.findRecent(size),
+      this.recentlyService.findRecent(size),
     ])
+    // The homepage renders only titles/metadata — keep `text`/`content`
+    // bodies out of this response or the SSR payload balloons by 100s of KB.
+    return {
+      notes: notes.map(omitArticleBody),
+      posts: posts.map(omitArticleBody),
+      says,
+      recently,
+    }
+  }
 
-    return { notes, posts, says, recently }
+  async getLatest(limit = 5, types?: TimelineType[], combined = false) {
+    const shouldFetchPosts = !types || types.includes(TimelineType.Post)
+    const shouldFetchNotes = !types || types.includes(TimelineType.Note)
+    const [posts, notes] = await Promise.all([
+      shouldFetchPosts
+        ? this.postService.findRecent(limit, { publishedOnly: true })
+        : undefined,
+      shouldFetchNotes
+        ? this.noteService.findRecent(limit, { visibleOnly: true })
+        : undefined,
+    ])
+    const publicPosts = posts?.map((post) => ({
+      ...post,
+      text: getPublicText(post),
+      content: getPublicContent(post),
+    }))
+    if (combined) {
+      return [
+        ...(publicPosts ?? []).map((item) => ({ ...item, type: 'post' })),
+        ...(notes ?? []).map((item) => ({ ...item, type: 'note' })),
+      ]
+        .sort(
+          (a, b) =>
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+        )
+        .slice(0, limit)
+    }
+    return {
+      ...(publicPosts ? { posts: publicPosts } : {}),
+      ...(notes ? { notes } : {}),
+    }
   }
 
   async getTimeline(
@@ -136,220 +146,98 @@ export class AggregateService {
     type: TimelineType | undefined,
     sortBy: 1 | -1 = 1,
   ) {
-    const data: any = {}
-    const getPosts = () =>
-      this.postService.model
-        .find({ ...addYearCondition(year) })
-        .sort({ created: sortBy })
-        .populate('category')
-
-        .then((list) =>
-          list.map((item) => ({
-            ...pick(item, ['_id', 'title', 'slug', 'created', 'modified']),
-            category: item.category,
-            // summary:
-            //   item.summary ??
-            //   (item.text.length > 150
-            //     ? item.text.slice(0, 150) + '...'
-            //     : item.text),
-            url: encodeURI(
-              `/posts/${(item.category as CategoryModel).slug}/${item.slug}`,
-            ),
-          })),
-        )
-
-    const getNotes = () =>
-      this.noteService.model
-        .find(
-          {
-            hide: false,
-            ...addYearCondition(year),
-          },
-          '_id nid title weather mood created modified bookmark',
-        )
-        .sort({ created: sortBy })
-        .lean()
-
-    switch (type) {
-      case TimelineType.Post: {
-        data.posts = await getPosts()
-        break
-      }
-      case TimelineType.Note: {
-        data.notes = await getNotes()
-        break
-      }
-      default: {
-        const tasks = await Promise.all([getPosts(), getNotes()])
-        data.posts = tasks[0]
-        data.notes = tasks[1]
-      }
+    const includePosts = type === undefined || type === TimelineType.Post
+    const includeNotes = type === undefined || type === TimelineType.Note
+    const sort: 'asc' | 'desc' = sortBy === 1 ? 'asc' : 'desc'
+    // Year filter is pushed into SQL — old in-memory filter after a
+    // 100-row LIMIT silently dropped older years. See repository
+    // `findByYearForTimeline`.
+    const [posts, notes] = await Promise.all([
+      includePosts
+        ? this.postService.repository.findByYearForTimeline({
+            year,
+            sort,
+            publishedOnly: true,
+          })
+        : [],
+      includeNotes
+        ? this.noteService.repository.findByYearForTimeline({
+            year,
+            sort,
+            visibleOnly: true,
+          })
+        : [],
+    ])
+    return {
+      posts: posts.map(omitArticleBody),
+      notes: notes.map(omitArticleBody),
     }
-
-    return data
   }
 
-  async getSiteMapContent() {
-    const {
-      url: { webUrl: baseURL },
-    } = await this.configs.waitForConfigReady()
-
-    const combineTasks = await Promise.all([
-      this.pageService.model
-        .find()
-        .lean()
-        .then((list) =>
-          list.map((doc) => ({
-            url: new URL(`/${doc.slug}`, baseURL),
-            published_at: doc.modified
-              ? new Date(doc.modified)
-              : new Date(doc.created!),
-          })),
-        ),
-
-      this.noteService.model
-        .find({
-          hide: false,
-
-          $or: [
-            {
-              publicAt: {
-                $lte: new Date(),
-              },
-            },
-            {
-              publicAt: {
-                $exists: false,
-              },
-            },
-            {
-              publicAt: null,
-            },
-          ],
-        })
-        .lean()
-        .then((list) =>
-          list.map((doc) => {
-            return {
-              url: new URL(`/notes/${doc.nid}`, baseURL),
-              published_at: doc.modified
-                ? new Date(doc.modified)
-                : new Date(doc.created!),
-            }
-          }),
-        ),
-
-      this.postService.model
-        .find()
-        .populate('category')
-        .then((list) =>
-          list.map((doc) => {
-            return {
-              url: new URL(
-                `/posts/${(doc.category as CategoryModel).slug}/${doc.slug}`,
-                baseURL,
-              ),
-              published_at: doc.modified
-                ? new Date(doc.modified)
-                : new Date(doc.created!),
-            }
-          }),
-        ),
+  async getSiteMapContent(): Promise<
+    Array<{ url: string; published_at: Date | null }>
+  > {
+    const baseUrl =
+      (await this.configs.get('url')).webUrl?.replace(/\/$/, '') ?? ''
+    // Full table scans on purpose — sitemaps must be exhaustive.
+    const [pages, posts, notes] = await Promise.all([
+      this.pageService.findAll(),
+      this.postService.repository.findPublishedForSitemap(),
+      this.noteService.repository.findVisibleForSitemap(),
     ])
-
-    return combineTasks
-      .flat(1)
-      .sort((a, b) => -(a.published_at.getTime() - b.published_at.getTime()))
+    const pickPublishedAt = (doc: {
+      modifiedAt?: Date | null
+      createdAt?: Date | null
+    }) => doc.modifiedAt ?? doc.createdAt ?? null
+    const pageEntries = pages.map((p) => ({
+      url: `${baseUrl}${this.urlBuilder.build(p as any)}`,
+      published_at: pickPublishedAt(p),
+    }))
+    const postEntries = posts.map((p) => ({
+      url: `${baseUrl}${this.urlBuilder.build(p as any)}`,
+      published_at: pickPublishedAt(p),
+    }))
+    const noteEntries = notes.map((n) => ({
+      url: `${baseUrl}${this.urlBuilder.build(n as any)}`,
+      published_at: pickPublishedAt(n),
+    }))
+    return [...pageEntries, ...postEntries, ...noteEntries].sort((a, b) => {
+      const left = a.published_at?.getTime() ?? 0
+      const right = b.published_at?.getTime() ?? 0
+      return right - left
+    })
   }
 
   async buildRssStructure(): Promise<RSSProps> {
-    const data = await this.getRSSFeedContent()
-    const seo = await this.configs.get('seo')
-    const author = (await this.userService.getMaster()).name
-    const url = (await this.configs.get('url')).webUrl
+    const [owner, seo, urlConfig, latest] = await Promise.all([
+      this.ownerService.getOwner(),
+      this.configs.get('seo'),
+      this.configs.get('url'),
+      this.getLatest(10, undefined, true),
+    ])
+    const baseURL = urlConfig.webUrl?.replace(/\/$/, '') ?? ''
+    const items = latest as Array<Record<string, any>>
     return {
-      title: seo.title,
-      description: seo.description,
-      author,
-      url,
-      data,
+      title: seo.title || owner.name || 'Mix Space',
+      url: urlConfig.webUrl ?? '',
+      author: owner.name || '',
+      description: seo.description || '',
+      data: items.map((item) => ({
+        created: item.createdAt ?? null,
+        modified: item.modifiedAt ?? null,
+        link: baseURL + this.urlBuilder.build(item as any),
+        title: item.title ?? '',
+        text: item.text ?? '',
+        id: item.id,
+        images: item.images ?? [],
+        contentFormat: item.contentFormat,
+        content: item.content ?? undefined,
+      })),
     }
   }
+
   async getRSSFeedContent() {
-    const {
-      url: { webUrl },
-    } = await this.configs.waitForConfigReady()
-
-    const baseURL = webUrl.replace(/\/$/, '')
-
-    const [posts, notes] = await Promise.all([
-      this.postService.model
-        .find()
-        .limit(10)
-        .sort({ created: -1 })
-        .populate('category'),
-
-      this.noteService.model
-        .find({
-          hide: false,
-          $and: [
-            {
-              $or: [
-                { password: undefined },
-                { password: { $exists: false } },
-                { password: null },
-              ],
-            },
-            {
-              $or: [
-                {
-                  publicAt: {
-                    $lte: new Date(),
-                  },
-                },
-                {
-                  publicAt: {
-                    $exists: false,
-                  },
-                },
-                {
-                  publicAt: null,
-                },
-              ],
-            },
-          ],
-        })
-        .limit(10)
-        .sort({ created: -1 }),
-    ])
-
-    const postsRss: RSSProps['data'] = posts.map((post) => {
-      return {
-        id: post.id,
-        title: post.title,
-        text: post.text,
-        created: post.created!,
-        modified: post.modified,
-        link: baseURL + this.urlService.build(post),
-        images: post.images || [],
-      }
-    })
-    const notesRss: RSSProps['data'] = notes.map((note) => {
-      return {
-        id: note.id,
-        title: note.title,
-        text: note.text,
-        created: note.created!,
-        modified: note.modified,
-        link: baseURL + this.urlService.build(note),
-        images: note.images || [],
-      }
-    })
-
-    return postsRss
-      .concat(notesRss)
-      .sort((a, b) => b.created!.getTime() - a.created!.getTime())
-      .slice(0, 10)
+    return this.getLatest(10, undefined, true)
   }
 
   async getCounts() {
@@ -357,42 +245,39 @@ export class AggregateService {
     const dateFormat = getShortDate(new Date())
 
     const [
-      online,
       posts,
       notes,
       pages,
       says,
-      comments,
-      allComments,
-      unreadComments,
+      commentsRootRead,
+      commentsRootUnread,
+      commentsAllRead,
+      commentsAllUnread,
       links,
       linkApply,
       categories,
       recently,
+      online,
     ] = await Promise.all([
-      this.gateway.getCurrentClientCount(),
-      this.postService.model.countDocuments(),
-      this.noteService.model.countDocuments(),
-      this.pageService.model.countDocuments(),
-      this.sayService.model.countDocuments(),
-      this.commentService.model.countDocuments({
-        parent: null,
-        $or: [{ state: CommentState.Read }, { state: CommentState.Unread }],
-      }),
-      this.commentService.model.countDocuments({
-        $or: [{ state: CommentState.Read }, { state: CommentState.Unread }],
-      }),
-      this.commentService.model.countDocuments({
-        state: CommentState.Unread,
-      }),
-      this.linkService.model.countDocuments({
-        state: LinkState.Pass,
-      }),
-      this.linkService.model.countDocuments({
-        state: LinkState.Audit,
-      }),
-      this.categoryService.model.countDocuments({}),
-      this.recentlyService.model.countDocuments({}),
+      this.postService.count(),
+      this.noteService.count(),
+      this.pageService.repository.count(),
+      this.sayService.count(),
+      // Root-thread visible counts: parity with old `comments` field which
+      // pre-PG filtered `parent: null AND state ∈ {Read, Unread}`. Spam (=2)
+      // and deleted rows are excluded by `countByState`.
+      this.commentService.countByState(CommentState.Read, true),
+      this.commentService.countByState(CommentState.Unread, true),
+      // Visible totals (no parent filter): parity with old `allComments`.
+      this.commentService.countByState(CommentState.Read),
+      this.commentService.countByState(CommentState.Unread),
+      // `links` historically counted approved entries; `linkApply` counted
+      // pending audit. The PG cutover silently flipped both — restored here.
+      this.linkService.countByState(LinkState.Pass),
+      this.linkService.countByState(LinkState.Audit),
+      this.categoryService.repository.countAll(),
+      this.recentlyService.count(),
+      this.webGateway.getCurrentClientCount().catch(() => 0),
     ])
 
     const [todayMaxOnline, todayOnlineTotal] = await Promise.all([
@@ -404,124 +289,259 @@ export class AggregateService {
     ])
 
     return {
-      allComments,
-      categories,
-      comments,
-      linkApply,
-      links,
+      posts,
       notes,
       pages,
-      posts,
       says,
+      comments: commentsRootRead + commentsRootUnread,
+      allComments: commentsAllRead + commentsAllUnread,
+      unreadComments: commentsAllUnread,
+      links,
+      linkApply,
+      categories,
       recently,
-      unreadComments,
       online,
-      todayMaxOnline: todayMaxOnline || 0,
-      todayOnlineTotal: todayOnlineTotal || 0,
+      todayMaxOnline: todayMaxOnline ?? '0',
+      todayOnlineTotal: todayOnlineTotal ?? '0',
     }
   }
 
-  @OnEvent(EventBusEvents.CleanAggregateCache, { async: true })
-  public clearAggregateCache() {
-    const redis = this.redisService.getClient()
-    return Promise.all([
-      redis.del(CacheKeys.RSS),
-      redis.del(CacheKeys.RSSXml),
-      redis.del(CacheKeys.SiteMap),
-      redis.del(CacheKeys.SiteMapXml),
-      redis.del(CacheKeys.Aggregate),
-      redis.keys(`${API_CACHE_PREFIX}/aggregate*`).then((keys) => {
-        return keys.map((key) => redis.del(key))
-      }),
-      redis.keys(`${CacheKeys.Aggregate}*`).then((keys) => {
-        return keys.map((key) => redis.del(key))
-      }),
+  async getDesk(): Promise<DeskSummary> {
+    const [
+      unreadCommentCount,
+      unreadCommentRows,
+      linkApplicationCount,
+      linkApplicationPage,
+      scheduledNotes,
+    ] = await Promise.all([
+      this.commentService.countByState(CommentState.Unread),
+      this.commentService.findRecent(1, { state: CommentState.Unread }),
+      this.linkService.countByState(LinkState.Audit),
+      this.linkService.list(1, 1, LinkState.Audit),
+      this.noteService.repository.findScheduled(5),
     ])
+
+    const [latestUnreadComment] =
+      await this.commentService.attachRef(unreadCommentRows)
+    const latestLinkApplication = linkApplicationPage.data[0]
+
+    return {
+      unreadComments: {
+        count: unreadCommentCount,
+        latest: latestUnreadComment
+          ? {
+              id: String(latestUnreadComment.id),
+              author: latestUnreadComment.author ?? '',
+              text: latestUnreadComment.text,
+              refTitle: latestUnreadComment.ref?.title ?? null,
+            }
+          : null,
+      },
+      linkApplications: {
+        count: linkApplicationCount,
+        latest: latestLinkApplication
+          ? {
+              id: String(latestLinkApplication.id),
+              name: latestLinkApplication.name,
+              url: latestLinkApplication.url,
+            }
+          : null,
+      },
+      scheduledNotes: scheduledNotes.map((note) => ({
+        id: String(note.id),
+        nid: note.nid,
+        title: note.title,
+        publicAt: note.publicAt.toISOString(),
+      })),
+    }
+  }
+
+  async getOnThisDay(): Promise<OnThisDayEntry[]> {
+    const now = new Date()
+    const month = now.getMonth() + 1
+    const day = now.getDate()
+    const year = now.getFullYear()
+    const limit = 5
+    const [posts, notes] = await Promise.all([
+      this.postService.repository.findOnThisDay(month, day, year, limit),
+      this.noteService.repository.findOnThisDay(month, day, year, limit),
+    ])
+    const entries = [
+      ...posts.map((row) => ({ ...row, type: 'post' as const })),
+      ...notes.map((row) => ({ ...row, type: 'note' as const })),
+    ]
+    entries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    return entries.slice(0, limit).map((entry) => ({
+      id: String(entry.id),
+      type: entry.type,
+      title: entry.title,
+      created: entry.createdAt.toISOString(),
+      excerpt: (entry.text ?? '').slice(0, 80),
+    }))
+  }
+
+  async getPublishHeatmap(): Promise<HeatmapDay[]> {
+    const since = new Date()
+    since.setDate(since.getDate() - 365)
+    const [postDays, noteDays] = await Promise.all([
+      this.postService.repository.countPublishedByDay(since),
+      this.noteService.repository.countPublishedByDay(since),
+    ])
+    const merged = new Map<string, number>()
+    for (const { date, count } of [...postDays, ...noteDays]) {
+      merged.set(date, (merged.get(date) ?? 0) + count)
+    }
+    return [...merged.entries()]
+      .map(([date, count]) => ({ date, count }))
+      .sort((a, b) => a.date.localeCompare(b.date))
   }
 
   async getAllReadAndLikeCount(type: ReadAndLikeCountDocumentType) {
-    const pipeline = [
-      {
-        $match: {
-          count: { $exists: true }, // 筛选存在 count 字段的文档
-        },
-      },
-      {
-        $group: {
-          _id: null, // 不根据特定字段分组
-          totalLikes: { $sum: '$count.like' }, // 计算所有文档的 like 总和
-          totalReads: { $sum: '$count.read' }, // 计算所有文档的 read 总和
-        },
-      },
-      {
-        $project: {
-          _id: 0, // 不显示 _id 字段
-        },
-      },
-    ]
-
-    let counts = {
-      totalLikes: 0,
-      totalReads: 0,
-    }
-
     switch (type) {
       case ReadAndLikeCountDocumentType.Post: {
-        const result = await this.postService.model.aggregate(pipeline)
-        if (result[0]) counts = result[0]
-
-        break
+        return this.postService.repository.aggregateReadAndLikeSums()
       }
       case ReadAndLikeCountDocumentType.Note: {
-        const result = await this.postService.model.aggregate(pipeline)
-        if (result[0]) counts = result[0]
-        break
+        return this.noteService.repository.aggregateReadAndLikeSums()
       }
-      case ReadAndLikeCountDocumentType.All: {
-        const results = await Promise.all([
-          this.getAllReadAndLikeCount(ReadAndLikeCountDocumentType.Post),
-          this.getAllReadAndLikeCount(ReadAndLikeCountDocumentType.Note),
+      default: {
+        const [postSums, noteSums] = await Promise.all([
+          this.postService.repository.aggregateReadAndLikeSums(),
+          this.noteService.repository.aggregateReadAndLikeSums(),
         ])
-
-        for (const result of results) {
-          counts.totalLikes += result.totalLikes
-          counts.totalReads += result.totalReads
+        return {
+          totalLikes: postSums.totalLikes + noteSums.totalLikes,
+          totalReads: postSums.totalReads + noteSums.totalReads,
         }
       }
     }
-
-    return counts
   }
 
   async getAllSiteWordsCount() {
-    const pipeline: PipelineStage[] = [
-      {
-        $match: {
-          text: { $exists: true, $type: 'string' }, // 筛选存在且类型为字符串的 text 字段
-        },
-      },
-      {
-        $group: {
-          _id: null, // 不根据特定字段分组
-          totalCharacters: { $sum: { $strLenCP: '$text' } }, // 计算所有文档的 text 字符长度总和
-        },
-      },
-      {
-        $project: {
-          _id: 0, // 不显示 _id 字段
-        },
-      },
-    ]
-    const results = await Promise.all([
-      this.postService.model.aggregate(pipeline),
-      this.noteService.model.aggregate(pipeline),
-      this.pageService.model.aggregate(pipeline),
+    const [postSum, noteSum, pageSum] = await Promise.all([
+      this.postService.repository.sumTextLength(),
+      this.noteService.repository.sumTextLength(),
+      this.pageService.repository.sumTextLength(),
     ])
+    return postSum + noteSum + pageSum
+  }
 
-    return results.reduce((prev, curr) => {
-      const [result] = curr
-      if (!result) return prev
-      return prev + result.totalCharacters
-    }, 0)
+  async getSiteInfo() {
+    const [postCount, noteCount, totalWordCount, firstPost, firstNote] =
+      await Promise.all([
+        this.postService.count(),
+        this.noteService.count(),
+        this.getAllSiteWordsCount(),
+        this.postService.repository.findFirstPublishedAt(),
+        this.noteService.repository.findFirstCreatedAtVisible(),
+      ])
+    let firstPublishDate: Date | null
+    if (firstPost && firstNote) {
+      firstPublishDate = firstPost < firstNote ? firstPost : firstNote
+    } else {
+      firstPublishDate = firstPost ?? firstNote ?? null
+    }
+    return {
+      postCount,
+      noteCount,
+      totalWordCount,
+      firstPublishDate: firstPublishDate?.toISOString() ?? null,
+    }
+  }
+
+  async getCategoryDistribution() {
+    const [buckets, categories] = await Promise.all([
+      this.postService.repository.aggregatePublishedByCategory(),
+      this.categoryService.findAllCategory(),
+    ])
+    const categoryById = new Map(categories.map((c) => [c.id.toString(), c]))
+    return buckets.flatMap((bucket) => {
+      const cat = categoryById.get(bucket.categoryId.toString())
+      if (!cat) return []
+      return [
+        {
+          id: bucket.categoryId,
+          name: cat.name,
+          slug: cat.slug,
+          count: bucket.count,
+        },
+      ]
+    })
+  }
+
+  async getTagCloud() {
+    // Old shape was `[{tag, count}]`; SDK / dashboard `TagCloudItem` matches.
+    // Repository returns `{name, count}` for shared tag aggregation, so
+    // rename the key here.
+    const tags = await this.postService.repository.topTagsByCount(20)
+    return tags.map((t) => ({ tag: t.name, count: t.count }))
+  }
+
+  async getPublicationTrend() {
+    const now = new Date()
+    const from = dayjs.utc().subtract(12, 'months').startOf('month').toDate()
+    const [posts, notes] = await Promise.all([
+      this.postService.repository.aggregateMonthlyTrend({
+        from,
+        to: now,
+        publishedOnly: true,
+      }),
+      this.noteService.repository.aggregateMonthlyTrend({
+        from,
+        to: now,
+        visibleOnly: true,
+      }),
+    ])
+    const byDate = new Map<string, { posts: number; notes: number }>()
+    for (const item of posts) {
+      byDate.set(item.date, { posts: item.count, notes: 0 })
+    }
+    for (const item of notes) {
+      const existing = byDate.get(item.date) ?? { posts: 0, notes: 0 }
+      byDate.set(item.date, { ...existing, notes: item.count })
+    }
+    return [...byDate.entries()]
+      .map(([date, counts]) => ({ date, ...counts }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+  }
+
+  async getTopArticles() {
+    // Top 10 articles by `read_count desc` — old shape "most-read", not
+    // "most-recent". The PG cutover silently swapped the ordering.
+    const posts = await this.postService.repository.findTopByReadCount(10)
+    return posts.map((post) => ({
+      id: post.id,
+      title: post.title,
+      slug: post.slug,
+      reads: post.readCount ?? 0,
+      likes: post.likeCount ?? 0,
+      category: post.category
+        ? { name: post.category.name, slug: post.category.slug }
+        : null,
+    }))
+  }
+
+  async getCommentActivity() {
+    const now = new Date()
+    const from = new Date(now)
+    from.setDate(from.getDate() - 30)
+    from.setHours(0, 0, 0, 0)
+    return this.commentService.repository.aggregateDailyActivity({
+      from,
+      to: now,
+      states: [CommentState.Read, CommentState.Unread],
+    })
+  }
+
+  async getTrafficSource() {
+    return this.analyzeService.getUaTrafficDistribution()
+  }
+
+  @OnEvent(EventBusEvents.CleanAggregateCache)
+  async cleanCache() {
+    await Promise.all([
+      this.redisService.getClient().del(CacheKeys.RSS, CacheKeys.RSSXml),
+      this.redisService.deleteKeysByPattern(`${CacheKeys.Aggregate}*`),
+    ])
   }
 }
