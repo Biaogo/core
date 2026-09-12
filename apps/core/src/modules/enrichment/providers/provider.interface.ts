@@ -9,6 +9,8 @@ export const ENRICHMENT_PROVIDER_TOKEN = Symbol('ENRICHMENT_PROVIDER')
  * source URL) need {@link url} to reconstruct the upstream call.
  */
 export interface EnrichmentFetchContext {
+  /** Cancel upstream work when its execution lease is lost. */
+  signal?: AbortSignal
   /**
    * Source URL the user originally pasted, after registry-side normalization.
    * Available on cold paths (resolve) and on refresh paths where a cached row

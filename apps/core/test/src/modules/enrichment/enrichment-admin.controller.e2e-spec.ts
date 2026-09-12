@@ -8,6 +8,7 @@ import { ConfigsService } from '~/modules/configs/configs.service'
 import { EnrichmentController } from '~/modules/enrichment/enrichment.controller'
 import { EnrichmentRepository } from '~/modules/enrichment/enrichment.repository'
 import { EnrichmentService } from '~/modules/enrichment/enrichment.service'
+import { EnrichmentDeferredError } from '~/modules/enrichment/enrichment.types'
 import { EnrichmentCaptureRepository } from '~/modules/enrichment/enrichment-capture.repository'
 import { CaptureStorageService } from '~/modules/enrichment/providers/open-graph/capture-storage.service'
 
@@ -73,6 +74,7 @@ const captureStorageMock = {
 }
 
 const enrichmentServiceMock = {
+  getOne: vi.fn(),
   resolve: vi.fn(),
   search: vi.fn(),
   refresh: vi.fn(async () => baseRow.normalized),
@@ -82,6 +84,7 @@ const enrichmentServiceMock = {
 
 const configsServiceMock = {
   get: vi.fn(async (key: string) => {
+    if (key === 'url') return { webUrl: 'https://blog.example.com' }
     if (key === 'thirdPartyServiceIntegration') {
       return {
         openGraph: {
@@ -171,6 +174,19 @@ describe('EnrichmentController admin endpoints (e2e)', () => {
     )
     enrichmentServiceMock.refresh.mockResolvedValue(baseRow.normalized as any)
     enrichmentServiceMock.search.mockResolvedValue([baseRow.normalized] as any)
+  })
+
+  test('returns no content when a public lookup is cooling down', async () => {
+    enrichmentServiceMock.getOne.mockRejectedValueOnce(
+      new EnrichmentDeferredError(),
+    )
+    const res = await proxy.app.inject({
+      method: 'GET',
+      url: `${apiRoutePrefix}/enrichment/open-graph/example`,
+      headers: { origin: 'https://blog.example.com' },
+    })
+    expect(res.statusCode).toBe(204)
+    expect(res.body).toBe('')
   })
 
   describe('auth gating', () => {
@@ -368,7 +384,7 @@ describe('EnrichmentController admin endpoints (e2e)', () => {
       'open-graph',
       'og:example',
       '',
-      { url: 'https://example.com/post' },
+      { url: 'https://example.com/post', force: true },
     )
     const body = res.json()
     expect(body.data.url).toBe(captureImage.url)

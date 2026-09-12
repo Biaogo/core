@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+# Chromium subprocess failures must not fill the application filesystem.
+# Opt in only when a bounded diagnostic destination has been provisioned.
+ulimit -S -c "${MX_CORE_DUMP_LIMIT:-0}"
+
 # Keep this entrypoint tiny:
 # - `apps/core/src/app.config.ts` already supports argv + env fallback.
 # - Here we only provide backward-compatible env aliases, a masked config summary,
@@ -222,5 +226,5 @@ else
   echo "Skipping auto-migrate (MX_AUTO_MIGRATE=${MX_AUTO_MIGRATE})"
 fi
 
-echo "Exec: node main.mjs ${*:-<none>}"
-exec node main.mjs "$@"
+echo "Exec: browser supervisor -> node main.mjs ${*:-<none>}"
+exec node docker-browser-watchdog.mjs main.mjs "$@"

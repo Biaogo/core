@@ -36,6 +36,7 @@ import {
 } from './enrichment.schema'
 import { EnrichmentService } from './enrichment.service'
 import {
+  EnrichmentDeferredError,
   type EnrichmentResult,
   ProviderDisabledError,
   type ProviderMeta,
@@ -82,6 +83,7 @@ export class EnrichmentController {
       return result as EnrichmentResult
     } catch (error) {
       if (
+        error instanceof EnrichmentDeferredError ||
         error instanceof ProviderDisabledError ||
         error instanceof TokenMissingError
       ) {
@@ -128,11 +130,20 @@ export class EnrichmentController {
     @Param('provider') provider: string,
     @Req() req: FastifyRequest,
     @Lang() lang: string | undefined,
-  ): Promise<EnrichmentResult> {
+    @Res({ passthrough: true }) res: any,
+  ): Promise<EnrichmentResult | undefined> {
     const id = decodeURIComponent((req.params as Record<string, string>)['*'])
-    const result = await this.enrichmentService.getOne(provider, id, lang)
-    this.bumpCaptureAccess(result)
-    return result
+    try {
+      const result = await this.enrichmentService.getOne(provider, id, lang)
+      this.bumpCaptureAccess(result)
+      return result
+    } catch (error) {
+      if (error instanceof EnrichmentDeferredError) {
+        res.status(204)
+        return
+      }
+      throw error
+    }
   }
 
   private bumpCaptureAccess(result: EnrichmentResult | undefined): void {
@@ -166,7 +177,7 @@ export class EnrichmentController {
     @Query('lang') lang?: string,
   ): Promise<EnrichmentResult> {
     const id = decodeURIComponent((req.params as Record<string, string>)['*'])
-    return this.enrichmentService.refresh(provider, id, lang)
+    return this.enrichmentService.refresh(provider, id, lang, { force: true })
   }
 
   @Delete('admin/cache/:provider/*')
@@ -281,6 +292,7 @@ export class EnrichmentController {
       row.locale,
       {
         url: row.url,
+        force: true,
       },
     )
 
