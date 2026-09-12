@@ -35,6 +35,10 @@ export enum EventTypes {
   // Unified Task Queue realtime fan-out. Hand-duplicated from
   // apps/core/src/constants/business-event.constant.ts — no monorepo import.
   TASK_UPDATE = 'task.update',
+
+  // Draft head moved (revision created/updated). Hand-duplicated from
+  // apps/core/src/constants/business-event.constant.ts — no monorepo import.
+  DRAFT_UPDATE = 'draft.update',
 }
 
 /**
@@ -84,3 +88,22 @@ export type TaskUpdatePayload =
     })
 
 export type NotificationTypes = 'error' | 'info' | 'success' | 'warn'
+
+/**
+ * Payload of the DRAFT_UPDATE broadcast — verbatim mirror of the server-side
+ * DraftUpdateEventPayload declared in
+ * apps/core/src/modules/draft/draft.types.ts. Keep in sync by hand; there is
+ * intentionally no cross-package import.
+ *
+ * It carries only identity and the new head: the editor already holds the
+ * content, and comparing one revision id is enough to know whether its view
+ * is stale. Never treat receipt as authoritative content — re-read the draft.
+ */
+export interface DraftUpdatePayload {
+  /** The draft id used in the write page URL (`draftId` query param). */
+  branchId: string
+  documentId: string
+  headRevisionId: string
+  refId: null | string
+  refType: 'note' | 'page' | 'post'
+}

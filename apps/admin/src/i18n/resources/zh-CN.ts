@@ -3723,6 +3723,13 @@ export const zhCN = {
   'write.relativeTime.hoursAgo': '{count} 小时前',
   'write.relativeTime.justNow': '刚刚',
   'write.relativeTime.minutesAgo': '{count} 分钟前',
+  'write.remoteUpdate.message':
+    '草稿已在其他位置更新，你本地还有未保存的修改。',
+  'write.remoteUpdate.useNew': '使用新版',
+  'write.remoteUpdate.merge': '合并',
+  'write.remoteUpdate.confirm.title': '放弃未保存的修改？',
+  'write.remoteUpdate.confirm.description':
+    '使用新版会覆盖你尚未保存的修改，且无法撤销。',
   'write.richEditor.placeholder': '输入正文...',
   'write.section.draft.applyDraft': '套用草稿',
   'write.section.draft.empty': '暂无可恢复草稿。',
@@ -3821,6 +3828,7 @@ export const zhCN = {
   'write.toast.draftConflictNeedsReview': '有 {count} 项重叠修改需要确认',
   'write.toast.draftLocalKept': '已保留当前内容，将继续保存为草稿',
   'write.toast.draftRemoteApplied': '已使用服务器草稿',
+  'write.toast.draftRemoteUpdateLoaded': '已载入最新版本',
   'write.toast.draftSaved': '草稿已保存',
   'write.toast.publishedDraftSaved': '修改已保存为草稿，尚未更新线上文章',
   'write.toast.unpublishedSaved': '未发布内容已保存',

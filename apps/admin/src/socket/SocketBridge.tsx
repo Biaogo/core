@@ -19,7 +19,9 @@ import {
 import { GATEWAY_URL } from '../constants/env'
 import { translate } from '../i18n/translate'
 import { adminQueryKeys } from '../query/keys'
+import { emitDraftUpdate } from './draft-update-signal'
 import type {
+  DraftUpdatePayload,
   NotificationTypes,
   TaskUpdatePayload,
   TaskUpdateStreamFrame,
@@ -152,6 +154,10 @@ export function SocketBridge() {
         }
         case EventTypes.TASK_UPDATE: {
           handleTaskUpdate(queryClient, payload)
+          break
+        }
+        case EventTypes.DRAFT_UPDATE: {
+          if (isDraftUpdatePayload(payload)) emitDraftUpdate(payload)
           break
         }
         default: {
@@ -502,4 +508,18 @@ function isTaskUpdatePayload(value: unknown): value is TaskUpdatePayload {
   if (!value || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   return typeof v.id === 'string' && typeof v.phase === 'string'
+}
+
+function isDraftUpdatePayload(value: unknown): value is DraftUpdatePayload {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  // Structural check only, matching `isTaskUpdatePayload`: the two fields the
+  // consumer actually reads are enough to reject a malformed frame, and
+  // enumerating `refType` would silently drop the event if the server ever
+  // adds a fourth ref type.
+  return (
+    typeof v.branchId === 'string' &&
+    typeof v.documentId === 'string' &&
+    typeof v.headRevisionId === 'string'
+  )
 }

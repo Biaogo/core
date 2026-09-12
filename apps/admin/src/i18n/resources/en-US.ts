@@ -3906,6 +3906,13 @@ export const enUS = {
   'write.relativeTime.hoursAgo': '{count} hours ago',
   'write.relativeTime.justNow': 'just now',
   'write.relativeTime.minutesAgo': '{count} minutes ago',
+  'write.remoteUpdate.message':
+    'The draft was updated elsewhere. Your unsaved changes are still here.',
+  'write.remoteUpdate.useNew': 'Use new version',
+  'write.remoteUpdate.merge': 'Merge',
+  'write.remoteUpdate.confirm.title': 'Discard unsaved changes?',
+  'write.remoteUpdate.confirm.description':
+    'Loading the new version replaces your unsaved edits and cannot be undone.',
   'write.richEditor.placeholder': 'Enter content...',
   'write.section.draft.applyDraft': 'Apply draft',
   'write.section.draft.empty': 'No drafts to restore.',
@@ -4014,6 +4021,7 @@ export const enUS = {
   'write.toast.draftLocalKept':
     'Current content kept; it will continue saving as a draft',
   'write.toast.draftRemoteApplied': 'Server draft applied',
+  'write.toast.draftRemoteUpdateLoaded': 'Loaded the latest version',
   'write.toast.draftSaved': 'Draft saved',
   'write.toast.publishedDraftSaved':
     'Changes saved as a draft and not yet applied to the online article',

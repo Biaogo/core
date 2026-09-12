@@ -1,12 +1,12 @@
 import type { LucideIcon } from 'lucide-react'
-import { AlertCircle, History, X } from 'lucide-react'
+import { AlertCircle, CloudDownload, History, X } from 'lucide-react'
 
 import { useI18n } from '~/i18n'
 import { Button } from '~/ui/primitives/button'
 import { cn } from '~/utils/cn'
 
 interface DraftHintBannerProps {
-  variant: 'list' | 'recovery'
+  variant: 'list' | 'recovery' | 'remote-update'
   message: string
   actionLabel: string
   onAction: () => void
@@ -22,6 +22,7 @@ const variantConfig: Record<
     icon: LucideIcon
     cardClass: string
     iconClass: string
+    messageClass: string
     actionVariant: 'primary' | 'secondary'
     dismissClass: string
   }
@@ -30,6 +31,7 @@ const variantConfig: Record<
     icon: History,
     cardClass: 'bg-surface-card border-border',
     iconClass: 'text-fg-muted',
+    messageClass: 'text-fg',
     actionVariant: 'secondary',
     dismissClass:
       'text-fg-subtle hover:bg-black/[0.06] hover:text-fg dark:hover:bg-white/[0.08]',
@@ -39,9 +41,19 @@ const variantConfig: Record<
     cardClass:
       'bg-amber-50 border-amber-200 dark:bg-amber-950/30 dark:border-amber-900/40',
     iconClass: 'text-amber-600 dark:text-amber-400',
+    messageClass: 'text-amber-900 dark:text-amber-100',
     actionVariant: 'primary',
     dismissClass:
       'text-amber-700/70 hover:bg-amber-100 hover:text-amber-900 dark:text-amber-300/70 dark:hover:bg-amber-900/40 dark:hover:text-amber-200',
+  },
+  'remote-update': {
+    icon: CloudDownload,
+    cardClass: 'bg-surface-card border-border',
+    iconClass: 'text-accent',
+    messageClass: 'text-fg',
+    actionVariant: 'primary',
+    dismissClass:
+      'text-fg-subtle hover:bg-black/[0.06] hover:text-fg dark:hover:bg-white/[0.08]',
   },
 }
 
@@ -50,6 +62,7 @@ export function DraftHintBanner(props: DraftHintBannerProps) {
     icon: Icon,
     cardClass,
     iconClass,
+    messageClass,
     actionVariant,
     dismissClass,
   } = variantConfig[props.variant]
@@ -67,9 +80,7 @@ export function DraftHintBanner(props: DraftHintBannerProps) {
       <span
         className={cn(
           'min-w-0 flex-1 text-sm max-sm:basis-[calc(100%-2rem)]',
-          props.variant === 'recovery'
-            ? 'text-amber-900 dark:text-amber-100'
-            : 'text-fg',
+          messageClass,
         )}
       >
         {props.message}

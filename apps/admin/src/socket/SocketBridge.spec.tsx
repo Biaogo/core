@@ -95,6 +95,7 @@ vi.mock('sonner', () => ({
 
 const { SocketBridge, getAdminSocket, handleTaskUpdate } =
   await import('./SocketBridge')
+const { subscribeDraftUpdate } = await import('./draft-update-signal')
 const { EventTypes } = await import('./types')
 const { toast } = await import('sonner')
 
@@ -704,6 +705,55 @@ describe('SocketBridge — transport wiring', () => {
     expect(
       queryClient.getQueryData(adminQueryKeys.tasks.taskDetail('wired-1')),
     ).toBeUndefined()
+  })
+
+  it('forwards a DRAFT_UPDATE payload to draft-update subscribers', () => {
+    renderSocketBridge(harness)
+    const client = instances[0]
+
+    const received: unknown[] = []
+    const unsubscribe = subscribeDraftUpdate((payload) => {
+      received.push(payload)
+    })
+    const payload = {
+      branchId: 'draft-1',
+      documentId: 'doc-1',
+      headRevisionId: 'rev-2',
+      refId: 'post-1',
+      refType: 'post' as const,
+    }
+
+    try {
+      client.emit(EventTypes.DRAFT_UPDATE, payload)
+      // An unrecognized refType is tolerated: the guard only requires the
+      // identity fields, so a ref type added server-side later cannot silently
+      // dead-end the event here.
+      client.emit(EventTypes.DRAFT_UPDATE, { ...payload, refType: 'chapter' })
+    } finally {
+      unsubscribe()
+    }
+
+    expect(received).toEqual([payload, { ...payload, refType: 'chapter' }])
+  })
+
+  it('drops a malformed DRAFT_UPDATE payload instead of forwarding it', () => {
+    renderSocketBridge(harness)
+    const client = instances[0]
+
+    const received: unknown[] = []
+    const unsubscribe = subscribeDraftUpdate((payload) => {
+      received.push(payload)
+    })
+
+    try {
+      client.emit(EventTypes.DRAFT_UPDATE, { branchId: 'draft-1' })
+      client.emit(EventTypes.DRAFT_UPDATE, {})
+      client.emit(EventTypes.DRAFT_UPDATE, null)
+    } finally {
+      unsubscribe()
+    }
+
+    expect(received).toEqual([])
   })
 
   it('closes the client on an AUTH_FAILED event', () => {

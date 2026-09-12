@@ -147,6 +147,8 @@ import type { PageModel } from '~/models/page'
 import type { PostModel } from '~/models/post'
 import type { TopicModel } from '~/models/topic'
 import { adminQueryKeys } from '~/query/keys'
+import { subscribeDraftUpdate } from '~/socket/draft-update-signal'
+import type { DraftUpdatePayload } from '~/socket/types'
 import { confirmDialog } from '~/ui/feedback/confirm'
 import { Drawer } from '~/ui/feedback/drawer'
 import { Modal, ModalFooter, ModalHeader } from '~/ui/feedback/modal'
@@ -455,6 +457,7 @@ function useDraftSession(options: {
   const latestFingerprintRef = useRef(options.fingerprint)
   const autosaveTimerRef = useRef<number | null>(null)
   const [acceptedFingerprint, setAcceptedFingerprint] = useState('')
+  const [remoteUpdateStale, setRemoteUpdateStale] = useState(false)
   const [conflict, setConflict] = useState<ActiveDraftConflict | null>(null)
   const [conflictDialogOpen, setConflictDialogOpen] = useState(false)
   const [resolvingConflict, setResolvingConflict] = useState(false)
@@ -497,6 +500,190 @@ function useDraftSession(options: {
   const markDirty = useCallback((dirty = true) => {
     dirtyRef.current = dirty
   }, [])
+
+  /**
+   * Reconcile a head that moved while we were looking at it: fetch the current
+   * remote head and merge it into the local content. Both the save-conflict
+   * handler (DRAFT_HEAD_CONFLICT) and the realtime `draft.update` banner go
+   * through here, so a merge behaves identically however it was triggered.
+   */
+  const reconcileWithRemote = useCallback(
+    async (input: { base: DraftModel | null; remoteId: string }) => {
+      const remote = await getDraftById(input.remoteId)
+      const local = latestDataRef.current
+      acceptedDraftRef.current = remote
+      setDraftId(remote.id)
+
+      if (!input.base) {
+        setConflict({
+          conflicts: [
+            {
+              base: null,
+              kind: 'field',
+              local,
+              path: 'draft',
+              remote,
+            },
+          ],
+          remote,
+        })
+        dirtyRef.current = true
+        return
+      }
+
+      const merged = mergeDraftConflict({
+        base: input.base,
+        local,
+        remote,
+      })
+      options.setState((previous) =>
+        fromRevision(options.kind, merged.data, previous),
+      )
+      dirtyRef.current = true
+
+      if (merged.conflicts.length > 0) {
+        setConflict({ conflicts: merged.conflicts, remote })
+        toast.error(
+          t('write.toast.draftConflictNeedsReview', {
+            count: merged.conflicts.length,
+          }),
+        )
+      } else {
+        setConflict(null)
+        toast.success(
+          t('write.toast.draftAutoMerged', {
+            count: merged.autoMergedChanges,
+          }),
+        )
+      }
+    },
+    [options, t],
+  )
+
+  /**
+   * Adopt a freshly read remote head as the editor's content, through the same
+   * accept path a normal load uses. Anything unsaved is gone — callers must
+   * have established that this is what the user wants.
+   */
+  const adoptRemoteDraft = useCallback(
+    (remote: DraftModel) => {
+      const nextState = fromRevision(
+        options.kind,
+        remote.headRevision,
+        options.state,
+      )
+      const refId = options.isEditing ? options.id : undefined
+      const fingerprint = getDraftFingerprint(options.kind, nextState, refId)
+      options.setState(nextState)
+      latestDataRef.current = toDraftData(options.kind, nextState, refId)
+      accept(remote, fingerprint, { draftId: remote.id })
+      setConflict(null)
+      setRemoteUpdateStale(false)
+      queryClient.setQueryData(adminQueryKeys.drafts.detail(remote.id), remote)
+      toast.success(t('write.toast.draftRemoteUpdateLoaded'))
+    },
+    [accept, options, queryClient, t],
+  )
+
+  /**
+   * Read the draft we currently have open. `force` is set only by the banner's
+   * explicit "Use new version": it adopts whatever the server has, while the
+   * automatic (realtime) path backs off whenever the editor moved on — a save
+   * of ours in flight, a head we already hold, or edits typed while this read
+   * was in flight. A save that is already in flight reconciles itself through
+   * its own onSuccess/onError.
+   */
+  const adoptLatestRemoteDraft = useCallback(
+    async (force: boolean) => {
+      const remoteId = acceptedDraftRef.current?.id ?? draftId
+      if (!remoteId) return
+
+      try {
+        const remote = await getDraftById(remoteId)
+        if (!force) {
+          // The server broadcasts the new head before the save response reaches
+          // us, so our own save can land here first; the response-first order
+          // is caught by the head comparison.
+          if (mutationRef.current.isPending) return
+          if (
+            remote.headRevisionId === acceptedDraftRef.current?.headRevisionId
+          )
+            return
+          if (hasUnsavedChanges()) {
+            setRemoteUpdateStale(true)
+            return
+          }
+        }
+        adoptRemoteDraft(remote)
+      } catch (error) {
+        toast.error(
+          getErrorMessage(error, t('write.toast.draftConflictLoadFailed')),
+        )
+      }
+    },
+    [adoptRemoteDraft, draftId, hasUnsavedChanges, t],
+  )
+
+  /**
+   * "Use new version" — one click replaces the open draft with the server head.
+   * Only unsaved local edits are worth a prompt; with a clean editor the click
+   * is the same silent adoption the realtime path performs.
+   */
+  const useRemoteUpdate = useCallback(async () => {
+    if (
+      hasUnsavedChanges() &&
+      !(await confirmDialog({
+        confirmText: t('write.remoteUpdate.useNew'),
+        description: t('write.remoteUpdate.confirm.description'),
+        destructive: true,
+        title: t('write.remoteUpdate.confirm.title'),
+      }))
+    ) {
+      return
+    }
+
+    await adoptLatestRemoteDraft(true)
+  }, [adoptLatestRemoteDraft, hasUnsavedChanges, t])
+
+  const mergeRemoteUpdate = useCallback(async () => {
+    const remoteId = acceptedDraftRef.current?.id ?? draftId
+    if (!remoteId) return
+
+    try {
+      await reconcileWithRemote({ base: acceptedDraftRef.current, remoteId })
+      setRemoteUpdateStale(false)
+    } catch (error) {
+      toast.error(
+        getErrorMessage(error, t('write.toast.draftConflictLoadFailed')),
+      )
+    }
+  }, [draftId, reconcileWithRemote, t])
+
+  const dismissRemoteUpdate = useCallback(() => {
+    setRemoteUpdateStale(false)
+  }, [])
+
+  // Realtime "this draft moved elsewhere" signal, published by SocketBridge.
+  // Only the draft this page has open matters, and a payload carrying the head
+  // we already adopted is our own save echoed back.
+  const onRemoteUpdate = (payload: DraftUpdatePayload) => {
+    const openDraft = acceptedDraftRef.current
+    const currentDraftId = openDraft?.id ?? draftId
+    if (!currentDraftId || payload.branchId !== currentDraftId) return
+    if (payload.headRevisionId === openDraft?.headRevisionId) return
+
+    void adoptLatestRemoteDraft(false)
+  }
+  // The subscription is installed once and reads the handler through a ref.
+  // Depending on the handler's identity would re-subscribe on every render —
+  // i.e. on every keystroke — which both costs work and briefly opens a window
+  // where an update lands with no subscriber attached.
+  const onRemoteUpdateRef = useRef(onRemoteUpdate)
+  onRemoteUpdateRef.current = onRemoteUpdate
+  useEffect(
+    () => subscribeDraftUpdate((payload) => onRemoteUpdateRef.current(payload)),
+    [],
+  )
 
   const buildSaveVariables = useCallback(
     (explicit = false): DraftSaveVariables => ({
@@ -550,53 +737,11 @@ function useDraftSession(options: {
             return
           }
 
-          const remote = await getDraftById(remoteId)
-          const local = latestDataRef.current
-          acceptedDraftRef.current = remote
-          setDraftId(remote.id)
-
-          if (!variables.baseDraft) {
-            setConflict({
-              conflicts: [
-                {
-                  base: null,
-                  kind: 'field',
-                  local,
-                  path: 'draft',
-                  remote,
-                },
-              ],
-              remote,
-            })
-            dirtyRef.current = true
-            return
-          }
-
-          const merged = mergeDraftConflict({
+          await reconcileWithRemote({
             base: variables.baseDraft,
-            local,
-            remote,
+            remoteId,
           })
-          options.setState((previous) =>
-            fromRevision(options.kind, merged.data, previous),
-          )
-          dirtyRef.current = true
-
-          if (merged.conflicts.length > 0) {
-            setConflict({ conflicts: merged.conflicts, remote })
-            toast.error(
-              t('write.toast.draftConflictNeedsReview', {
-                count: merged.conflicts.length,
-              }),
-            )
-          } else {
-            setConflict(null)
-            toast.success(
-              t('write.toast.draftAutoMerged', {
-                count: merged.autoMergedChanges,
-              }),
-            )
-          }
+          setRemoteUpdateStale(false)
         } catch (loadError) {
           toast.error(
             getErrorMessage(
@@ -729,6 +874,7 @@ function useDraftSession(options: {
     },
     conflict,
     conflictDialogOpen,
+    dismissRemoteUpdate,
     draftId,
     getPublishInput: (currentDraftId: string) => ({
       baseline:
@@ -743,13 +889,16 @@ function useDraftSession(options: {
     latestDraft: () => acceptedDraftRef.current ?? mutation.data,
     latestFingerprint: () => latestFingerprintRef.current,
     markDirty,
+    mergeRemoteUpdate,
     mutation,
+    remoteUpdateStale,
     resolvingConflict,
     saveNow,
     setConflict,
     setConflictDialogOpen,
     setDraftId,
     useRemoteConflictDraft,
+    useRemoteUpdate,
   }
 }
 
@@ -934,12 +1083,16 @@ function WritePage(props: { kind: WriteKind }) {
   const {
     conflict: draftConflict,
     conflictDialogOpen: draftConflictDialogOpen,
+    dismissRemoteUpdate,
     draftId,
+    mergeRemoteUpdate,
     mutation: draftMutation,
+    remoteUpdateStale,
     resolvingConflict: draftConflictResolving,
     saveNow: saveDraftNow,
     setConflict: setDraftConflict,
     setConflictDialogOpen: setDraftConflictDialogOpen,
+    useRemoteUpdate,
   } = draftSession
   const handledPublishTaskRef = useRef('')
   const { socketConnected: publishTaskSocketConnected } =
@@ -1835,6 +1988,11 @@ function WritePage(props: { kind: WriteKind }) {
   const draftListHintCount =
     !isEditing && !routeDraftId ? activeNewDrafts.length : 0
   const showDraftListHint = draftListHintCount > 0 && !draftListHintDismissed
+  // The banner only exists to protect unsaved work: a clean editor is updated
+  // silently instead (see adoptLatestRemoteDraft). While a save conflict is
+  // unresolved the conflict banner already owns that decision.
+  const showRemoteUpdateHint =
+    remoteUpdateStale && !draftConflict && draftSession.hasUnsavedChanges()
   const selectedBranch =
     activeDocumentBranches.find(
       (branch) => branch.id === (draftId || routeDraftId),
@@ -2083,8 +2241,26 @@ function WritePage(props: { kind: WriteKind }) {
                       />
                     </div>
                   ) : null}
-                  {showDraftListHint ? (
+                  {showRemoteUpdateHint ? (
                     <div className={cn('mb-3', !draftConflict && '-mt-4')}>
+                      <DraftHintBanner
+                        actionLabel={t('write.remoteUpdate.useNew')}
+                        message={t('write.remoteUpdate.message')}
+                        onAction={useRemoteUpdate}
+                        onDismiss={dismissRemoteUpdate}
+                        onSecondaryAction={mergeRemoteUpdate}
+                        secondaryActionLabel={t('write.remoteUpdate.merge')}
+                        variant="remote-update"
+                      />
+                    </div>
+                  ) : null}
+                  {showDraftListHint ? (
+                    <div
+                      className={cn(
+                        'mb-3',
+                        !draftConflict && !showRemoteUpdateHint && '-mt-4',
+                      )}
+                    >
                       <DraftHintBanner
                         actionLabel={t('write.draftList.hintAction')}
                         message={t('write.draftList.hintMessage', {
