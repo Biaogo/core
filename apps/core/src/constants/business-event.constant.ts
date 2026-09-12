@@ -73,6 +73,11 @@ export enum BusinessEvents {
 
   ADMIN_NOTIFICATION = 'admin.notification',
 
+  // Draft revisions. Broadcast to admin so an editor holding a stale head can
+  // tell that the same draft moved underneath it instead of discovering it on
+  // the next save, when the change is already a conflict.
+  DRAFT_UPDATE = 'draft.update',
+
   // activity
   ACTIVITY_LIKE = 'activity.like',
   ACTIVITY_UPDATE_PRESENCE = 'activity.update_presence',

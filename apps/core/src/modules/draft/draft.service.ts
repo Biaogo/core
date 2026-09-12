@@ -3,9 +3,11 @@ import { randomBytes } from 'node:crypto'
 import { Injectable } from '@nestjs/common'
 
 import { AppErrorCode, createAppException } from '~/common/errors'
+import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { FileReferenceType } from '~/modules/file/file-reference.enum'
 import { FileReferenceService } from '~/modules/file/file-reference.service'
 import { DatabaseService } from '~/processors/database/database.service'
+import { EventManagerService } from '~/processors/helper/helper.event.service'
 import type { EntityId } from '~/shared/id/entity-id'
 
 import { DraftRefType } from './draft.enum'
@@ -23,6 +25,7 @@ import type {
   DraftBranchRow,
   DraftBranchView,
   DraftListFilter,
+  DraftUpdateEventPayload,
   RevisionComparison,
   RevisionSnapshot,
   SharedRevisionSnapshot,
@@ -138,6 +141,7 @@ export class DraftService {
     private readonly draftRepository: DraftRepository,
     private readonly fileReferenceService: FileReferenceService,
     private readonly databaseService: DatabaseService,
+    private readonly eventManager: EventManagerService,
   ) {}
 
   get repository() {
@@ -236,7 +240,9 @@ export class DraftService {
       created.branch.id,
       FileReferenceType.Draft,
     )
-    return this.hydrate(created.branch)
+    const view = await this.hydrate(created.branch)
+    this.broadcastUpdate(view)
+    return view
   }
 
   async update(id: string, dto: UpdateDraftDto): Promise<DraftBranchView> {
@@ -271,7 +277,28 @@ export class DraftService {
       result.branch.id,
       FileReferenceType.Draft,
     )
-    return this.hydrate(result.branch)
+    const view = await this.hydrate(result.branch)
+    this.broadcastUpdate(view)
+    return view
+  }
+
+  /**
+   * Tells every connected admin that this branch has a new head. Best-effort by
+   * design: the save already committed, so a broadcast failure must not surface
+   * as a failed request — the client still gets the new head in the response.
+   */
+  private broadcastUpdate(view: DraftBranchView) {
+    void this.eventManager.emit(
+      BusinessEvents.DRAFT_UPDATE,
+      {
+        branchId: view.id,
+        documentId: view.documentId,
+        headRevisionId: view.headRevisionId,
+        refId: view.document.refId,
+        refType: view.document.refType,
+      } satisfies DraftUpdateEventPayload,
+      { scope: EventScope.TO_ADMIN },
+    )
   }
 
   async findById(id: string): Promise<DraftBranchView | null> {

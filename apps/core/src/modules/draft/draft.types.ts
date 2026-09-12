@@ -121,3 +121,17 @@ export interface SharedRevisionSnapshot {
   text: string
   title: string
 }
+
+/**
+ * Payload of the `draft.update` admin broadcast. Carries only identity and the
+ * new head: the editor that receives it already has the content, and comparing
+ * one revision id is enough to decide whether its view is stale. Clients must
+ * not treat receipt as authoritative content — re-read the draft instead.
+ */
+export interface DraftUpdateEventPayload {
+  branchId: EntityId
+  documentId: EntityId
+  headRevisionId: EntityId
+  refId: EntityId | null
+  refType: DraftRefType
+}

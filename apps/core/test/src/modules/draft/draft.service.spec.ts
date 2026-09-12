@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { AppErrorCode } from '~/common/errors/app-error-code'
 import { AppException } from '~/common/errors/exception.types'
+import { BusinessEvents, EventScope } from '~/constants/business-event.constant'
 import { DraftRefType } from '~/modules/draft/draft.enum'
 import { DraftService } from '~/modules/draft/draft.service'
 import { FileReferenceType } from '~/modules/file/file-reference.enum'
@@ -72,6 +73,7 @@ const harness = () => {
     repository as never,
     fileReferences as never,
     {} as never,
+    { emit: vi.fn() } as never,
   )
   return { fileReferences, repository, service }
 }
@@ -349,5 +351,47 @@ describe('DraftService share links', () => {
 
     expect(repository.findBranchById).not.toHaveBeenCalled()
     expect(snapshot.title).toBe('Frozen')
+  })
+})
+
+describe('DraftService realtime notification', () => {
+  it('announces the new head to admin clients after a save', async () => {
+    const { repository, service } = harness()
+    const head = revision('branch-head-2', 'branch-head', 'Saved')
+    repository.findBranchById.mockResolvedValue(branch)
+    repository.findDocumentById.mockResolvedValue({
+      ...document,
+      publishedRevisionId: null,
+    })
+    repository.findRevisionById.mockImplementation(async (id: string) =>
+      id === head.id ? head : revision('branch-base', null, 'Base'),
+    )
+    repository.saveBranch.mockResolvedValue({
+      branch: { ...branch, headRevisionId: head.id },
+      headRevision: head,
+      kind: 'ok',
+    })
+
+    await service.update(branch.id, {
+      data: snapshot('Saved'),
+      expectedHeadRevisionId: 'branch-head',
+    } as never)
+
+    const { emit } = (service as unknown as { eventManager: { emit: unknown } })
+      .eventManager as { emit: ReturnType<typeof vi.fn> }
+
+    // Other admin clients learn the branch moved without polling. The payload
+    // carries identity plus the new head only; consumers re-read the draft.
+    expect(emit).toHaveBeenCalledWith(
+      BusinessEvents.DRAFT_UPDATE,
+      {
+        branchId: branch.id,
+        documentId: document.id,
+        headRevisionId: head.id,
+        refId: document.refId,
+        refType: document.refType,
+      },
+      { scope: EventScope.TO_ADMIN },
+    )
   })
 })
