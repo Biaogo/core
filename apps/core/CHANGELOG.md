@@ -1,3 +1,9 @@
+## [14.10.1](https://github.com/mx-space/core/compare/v14.10.0...v14.10.1) (2026-09-13)
+
+### Bug Fixes
+
+* **core:** bound browser processes and persist enrichment retry cooldowns ([f0419d5](https://github.com/mx-space/core/commit/f0419d58c4508a016367c1a2b4ff9d778352e5aa))
+
 ## [14.10.0](https://github.com/mx-space/core/compare/v14.9.1...v14.10.0) (2026-09-09)
 
 
