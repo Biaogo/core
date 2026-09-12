@@ -63,6 +63,7 @@ describe('mxs skill', () => {
         'commands-config',
         'commands-auth',
         'commands-profile',
+        'commands-author',
         'output-modes',
         'auth-config',
         'safety',

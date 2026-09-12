@@ -3,8 +3,6 @@
 @import './styles/tokens.css';
 @import 'sonner/dist/styles.css';
 
-@source "../node_modules/streamdown/dist/index.js";
-
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* Responsive variants — phone / tablet (max-width) and desktop (min-width). */

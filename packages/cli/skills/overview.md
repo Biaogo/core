@@ -29,7 +29,7 @@ The audience is **AI agents**. Pass `--output llm` for raw markdown suitable for
 | Server-side options                           | `commands-config`                |
 | Authentication                                | `commands-auth`                  |
 | Local profile management                      | `commands-profile`               |
-| Browser preview of LiteXML / envelopes        | `commands-preview`               |
+| Local admin editor for LiteXML / envelopes    | `commands-author`                |
 | Profiles, env vars, target selection          | `auth-config`                    |
 | Output modes (`--json`, `--output llm`, …)    | `output-modes`                   |
 | Mutation safety, verification, exit codes     | `safety`                         |

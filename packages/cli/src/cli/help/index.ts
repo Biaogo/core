@@ -35,7 +35,7 @@ import '../draft'
 import '../note'
 import '../page'
 import '../post'
-import '../preview'
+import '../author'
 import '../profile'
 import '../project'
 import '../skill'
@@ -87,7 +87,7 @@ export const GROUP_NAMES = [
   'ai',
   'config',
   'skill',
-  'preview',
+  'author',
   'update',
 ] as const
 
@@ -163,13 +163,11 @@ export const buildRootHelpData = (version: string): RootHelpData => ({
   version,
   description: ROOT_DESCRIPTION,
   globalOptions: GLOBAL_OPTIONS,
-  commands: orderedCommandHelp().map(
-    (c): SubcommandHelp => ({
-      name: c.name,
-      description: c.description,
-      verbs: c.verbs?.map((v) => v.name),
-    }),
-  ),
+  commands: orderedCommandHelp().map((c): SubcommandHelp => ({
+    name: c.name,
+    description: c.description,
+    verbs: c.verbs?.map((v) => v.name),
+  })),
 })
 
 const formatVerbs = (verbs?: readonly string[]): string => {

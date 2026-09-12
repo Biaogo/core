@@ -678,19 +678,17 @@ Example profile config:
 | `6`  | Server 5xx failure                                                           |
 | `7`  | Resource not found                                                           |
 
-## Preview
+## Author
 
-`mxs preview <file>` renders a LiteXML fragment or `<mxpost>` / `<mxnote>` envelope to HTML and opens it in your default browser. Use it to sanity-check what the article will look like before publishing.
+`mxs author <file>` opens the Mix Space admin rich editor for a LiteXML fragment or `<mxpost>` / `<mxnote>` envelope. Saving writes the file back and overwrites `<file>.diff` (current body vs the body frozen when the process started). The command does not contact `mx-core`.
 
 ```bash
-mxs preview ./post.xml                 # open in browser
-mxs preview - < note.xml               # read stdin
-mxs preview ./post.xml --theme dark    # dark theme
-mxs preview ./post.xml --save out.html # write HTML to file
-mxs preview ./post.xml --print         # emit HTML to stdout
+mxs author ./post.xml              # open the editor
+mxs author --no-open ./post.xml    # print the URL only
+mxs author --port 4173 ./note.xml  # fail if the port is taken
 ```
 
-The variant (`article` / `note`) is auto-detected from the envelope root. Override with `--variant` for raw LiteXML fragments. The command does not contact `mx-core` — it uses the LiteXML preview renderer vendored into the published CLI bundle.
+Only the envelope `<content>` is edited. Meta such as title, slug, and tags is left in place. Stdin is not accepted.
 
 ## Skill bundle
 
