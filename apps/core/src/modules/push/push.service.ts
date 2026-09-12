@@ -202,11 +202,17 @@ export class PushService implements OnModuleInit, OnModuleDestroy {
     }
 
     if ((scope & EventScope.TO_VISITOR) === 0) return
-    if (event === BusinessEvents.POST_CREATE) {
+    if (
+      event === BusinessEvents.POST_CREATE ||
+      event === BusinessEvents.POST_REPUBLISH
+    ) {
       await this.enqueueContentPublished(data, 'post')
       return
     }
-    if (event === BusinessEvents.NOTE_CREATE) {
+    if (
+      event === BusinessEvents.NOTE_CREATE ||
+      event === BusinessEvents.NOTE_REPUBLISH
+    ) {
       await this.enqueueContentPublished(data, 'note')
       return
     }

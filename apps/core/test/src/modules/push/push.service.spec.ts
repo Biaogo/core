@@ -176,6 +176,46 @@ describe('PushService', () => {
 
   it.each([
     {
+      event: BusinessEvents.POST_REPUBLISH,
+      resolvedType: 'post',
+      subject: 'post/post-1',
+    },
+    {
+      event: BusinessEvents.NOTE_REPUBLISH,
+      resolvedType: 'note',
+      subject: 'note/post-1',
+    },
+  ])(
+    'enqueues content.published on $event',
+    async ({ event, resolvedType, subject }) => {
+      database.findGlobalById.mockResolvedValue({
+        type: resolvedType,
+        document: {
+          id: 'post-1',
+          title: 'Published later',
+          slug: 'published-later',
+          nid: 7,
+          isPublished: true,
+          hasPassword: false,
+          publicAt: null,
+          category: { slug: 'journal' },
+        },
+      })
+      const service = createService()
+      service.onModuleInit()
+      handler?.(event, { id: 'post-1' }, EventScope.TO_SYSTEM_VISITOR)
+
+      await flushHandler()
+      expect(repository.enqueueDelivery.mock.calls[0]![0].event).toMatchObject({
+        id: `content.published:${resolvedType}:post-1`,
+        subject,
+      })
+      service.onModuleDestroy()
+    },
+  )
+
+  it.each([
+    {
       type: 'unpublished post',
       event: BusinessEvents.POST_CREATE,
       resolvedType: 'post',
